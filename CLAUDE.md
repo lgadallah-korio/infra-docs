@@ -70,17 +70,17 @@ experiments).
 
 Detailed reference documentation is split by domain:
 
-- **[Application Stack](docs/application-stack.md)** — NGINX routing
+- **[Application Stack](application-stack.md)** — NGINX routing
   and request flow, korioctl, dagger-presto, ArgoCD, Helm chart
   architecture, presto-besto-manifesto, Docker local dev, microservice
   deployment lifecycle, CI workflows, Azure B2C integration
-- **[Infrastructure](docs/infrastructure.md)** — External dependencies
+- **[Infrastructure](infrastructure.md)** — External dependencies
   (Cloudflare, B2C, MongoDB Atlas, Twingate), Terraform, deployment
   flow, sub-environment configuration and provisioning checklist
-- **[SFTP](docs/sftp.md)** — sftp-server-docker, sftp-acl-init-go,
+- **[SFTP](sftp.md)** — sftp-server-docker, sftp-acl-init-go,
   Kustomize deployment architecture, Azure Workload Identity
   (UAMI/FIC/DLDP), CI workflows
-- **[Observability](docs/observability.md)** — Datadog agent deployment
+- **[Observability](observability.md)** — Datadog agent deployment
   and integrations (ArgoCD, MongoDB), Azure Monitor (managed Prometheus,
   Container Insights, Log Analytics), Grafana dashboards and RBAC,
   alerting (Prometheus rules, Atlas alerts), PagerDuty escalation,
