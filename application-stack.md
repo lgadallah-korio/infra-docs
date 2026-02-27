@@ -1,5 +1,42 @@
 # Application Stack
 
+## Multi-Tenancy Model
+
+Rather than maintaining separate clusters or namespaces per client,
+Korio isolates client versions by **URL path**. Each client's version
+of a microservice gets its own path prefix, and NGINX routes incoming
+requests to the correct versioned service instance — rewriting the
+client-specific prefix to the canonical path before forwarding.
+
+```mermaid
+flowchart LR
+    subgraph req["Inbound requests - same domain, same cluster"]
+        PA["/api/v1/site-clientA/"]
+        PB["/api/v1/site-clientB/"]
+        PV["/api/v1/site-v3.1.0/"]
+    end
+
+    NX["NGINX ext. gateway"]
+
+    subgraph aks["AKS cluster"]
+        SA["sites-node-clientA<br/>branch: release/clientA"]
+        SB["sites-node-clientB<br/>branch: release/clientB"]
+        SV["back-end-node-v3.1.0<br/>branch: main"]
+    end
+
+    PA --> NX
+    PB --> NX
+    PV --> NX
+    NX -->|"rewrite to /api/v1/site/"| SA
+    NX -->|"rewrite to /api/v1/site/"| SB
+    NX -->|"rewrite to /api/v1/site/"| SV
+```
+
+Each service instance is a separate Kubernetes Deployment backed by a
+container image pinned to a specific git commit on a version branch.
+The microservice itself sees only the canonical path and has no
+knowledge of the client-specific prefix it was reached through.
+
 ## NGINX API Gateway
 
 ### Location Block Structure
