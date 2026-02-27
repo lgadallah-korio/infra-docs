@@ -87,7 +87,7 @@ sequenceDiagram
     participant B2C as Azure B2C
     participant MG as MongoDB
     participant BE as back-end-node
-    participant SVC as sites-node-{client}
+    participant SVC as sites-node-(client)
 
     rect rgb(220, 235, 255)
         Note over User,B2C: Phase 1 — Login & Client Resolution
@@ -102,19 +102,19 @@ sequenceDiagram
         AN->>MG: user lookup by emails[0]
         AN-->>NX: 200 + user header
         NX->>BE: GET /api/v1/info/ + X_HTTP_USER
-        BE-->>User: client context; SPA navigates -> /app-{client}/
+        BE-->>User: client context; SPA navigates -> /app-(client)/
     end
 
     rect rgb(220, 255, 220)
         Note over User,SVC: Phase 2 — Client App Load
-        User->>Edge: GET /app-{client}/
-        Edge-->>User: app-react-{client} SPA (pinned git SHA, path rewritten -> /)
-        Note right of User: API paths compiled into JS at build time:<br/>/api/v1/site-{client}/
+        User->>Edge: GET /app-(client)/
+        Edge-->>User: app-react-(client) SPA (pinned git SHA, path rewritten -> /)
+        Note right of User: API paths compiled into JS at build time:<br/>/api/v1/site-(client)/
     end
 
     rect rgb(255, 245, 210)
         Note over User,SVC: Phase 3 — Client API Call
-        User->>Edge: POST /api/v1/site-{client}/ + Bearer id_token
+        User->>Edge: POST /api/v1/site-(client)/ + Bearer id_token
         Edge->>NX: route to ext. gateway
         NX->>AN: auth_request /_auth-via-auth-node
         AN->>B2C: GET JWKS, validate JWT
