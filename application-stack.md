@@ -423,7 +423,27 @@ presto manifest's security configuration.
 
 ## Microservice Deployment Lifecycle
 
-When a developer adds a feature to a microservice, the sequence is:
+When a developer adds a feature to a microservice, the sequence is
+(yellow = manual step, green = automated):
+
+```mermaid
+flowchart TD
+    classDef manual fill:#ffe082,stroke:#f9a825,color:#000
+    classDef auto   fill:#c8e6c9,stroke:#388e3c,color:#000
+
+    S1["Microservice CI<br/>build image, push to ACR tagged with git SHA"]
+    S2["Developer updates presto-besto-manifesto<br/>image SHA, env vars, secrets - opens PR"]
+    S3["GitHub Actions fires on PR<br/>dagger-entrypoint.yml"]
+    S4["Dagger clones presto and argocd repos<br/>calls korioctl PushToArgo per changed env"]
+    S5["korioctl generates YAML<br/>ApplicationSets and NGINX ConfigMaps<br/>opens PR on argocd repo"]
+    S6["DevOps reviews and merges argocd PR"]
+    S7["ArgoCD detects changes<br/>renders Helm chart, applies to AKS"]
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
+
+    class S2,S6 manual
+    class S1,S3,S4,S5,S7 auto
+```
 
 **1. Build (microservice repo)**
 The developer's CI builds a Docker image and pushes it to ACR
