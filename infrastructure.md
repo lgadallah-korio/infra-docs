@@ -119,6 +119,25 @@ environment, managed by different systems:
    the full runbook. All DLDP entries for `prodsftpmirror` created
    (2026-02-26): biostats, cluepoints, icsf, maestro, pci, fisher.
 
+The current state of both lists, derived from `terraform-infra/env/locals.tf`
+and each `{env}/subenvironments.yaml`:
+
+| Environment | configure | preview | validate | accept | my | Notes |
+|---|:---:|:---:|:---:|:---:|:---:|---|
+| sandbox    | active  | -       | -       | -       | -      | TF provisions configure only |
+| dev        | active  | tf only | active  | tf only | tf only | |
+| test       | active  | tf only | active  | tf only | active  | |
+| platform   | active  | active  | active  | tf only | tf only | |
+| staging    | active  | active  | active  | tf only | tf only | |
+| prod       | active  | tf only | active  | active  | active  | preview: infra exists, not yet in presto |
+| platform3  | tf only | tf only | tf only | tf only | tf only | no presto env dir; v3/ReCode infra only |
+| staging3   | tf only | tf only | tf only | tf only | tf only | no presto env dir; v3/ReCode infra only |
+| prod3      | tf only | tf only | tf only | tf only | tf only | no presto env dir; v3/ReCode infra only |
+
+**Key:** `active` = deployed in both Terraform and presto pipeline;
+`tf only` = Azure infrastructure provisioned, not yet in presto pipeline;
+`-` = not provisioned in Terraform.
+
 ### What Terraform provisions per sub-environment
 
 Iterating over `sub_environments[environment]`, Terraform automatically
