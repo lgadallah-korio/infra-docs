@@ -231,6 +231,38 @@ env var.
 
 ## Key Repos and Commands
 
+The core repos and how they relate to each other:
+
+```mermaid
+flowchart LR
+    subgraph devInput["Developer input"]
+        PBM["presto-besto-manifesto<br/>image SHA, env vars, secrets per service"]
+    end
+
+    subgraph pipeline["CI and code generation"]
+        GHA["GitHub Actions"]
+        DP["dagger-presto"]
+        KC["korioctl"]
+    end
+
+    subgraph manifests["GitOps manifests"]
+        AR["argocd<br/>ApplicationSet YAML"]
+        KM["kubernetes-manifests<br/>Helm chart"]
+    end
+
+    ACD["ArgoCD"]
+    AKS["AKS cluster"]
+
+    PBM -->|"PR triggers"| GHA
+    GHA --> DP
+    DP --> KC
+    KC -->|"reads"| PBM
+    KC -->|"generates YAML, opens PR"| AR
+    AR -->|"auto-sync"| ACD
+    KM -->|"rendered by"| ACD
+    ACD -->|"applies to"| AKS
+```
+
 ### korioctl (Go CLI)
 
 Manifest-driven deployment tool that generates ArgoCD AppSet files and
