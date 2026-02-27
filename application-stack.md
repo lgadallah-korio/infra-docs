@@ -94,7 +94,7 @@ sequenceDiagram
         User->>Edge: GET /
         Edge-->>User: portico-react SPA
         User->>B2C: loginRedirect (MSAL)
-        B2C-->>User: id_token JWT + redirect -> /
+        B2C-->>User: id_token JWT, redirect to /
         User->>Edge: GET /api/v1/info/ + Bearer id_token
         Edge->>NX: route to ext. gateway
         NX->>AN: auth_request /_auth-via-auth-node
@@ -102,13 +102,13 @@ sequenceDiagram
         AN->>MG: user lookup by emails[0]
         AN-->>NX: 200 + user header
         NX->>BE: GET /api/v1/info/ + X_HTTP_USER
-        BE-->>User: client context; SPA navigates -> /app-(client)/
+        BE-->>User: client context, navigates to /app-(client)/
     end
 
     rect rgb(220, 255, 220)
         Note over User,SVC: Phase 2 — Client App Load
         User->>Edge: GET /app-(client)/
-        Edge-->>User: app-react-(client) SPA (pinned git SHA, path rewritten -> /)
+        Edge-->>User: app-react-(client) SPA, path rewritten to /
         Note right of User: API paths compiled into JS at build time:<br/>/api/v1/site-(client)/
     end
 
@@ -120,7 +120,7 @@ sequenceDiagram
         AN->>B2C: GET JWKS, validate JWT
         AN->>MG: user lookup, assert ACTIVE
         AN-->>NX: 200 + user header
-        NX->>SVC: rewrite -> /api/v1/site/ + X_HTTP_USER
+        NX->>SVC: rewrite to /api/v1/site/ + X_HTTP_USER
         SVC-->>User: API response
     end
 ```
