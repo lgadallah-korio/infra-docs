@@ -93,6 +93,188 @@ Code Repo → GitHub Actions → Docker Build → ACR → ArgoCD → AKS
 
 Manifest changes follow GitOps: commit → ArgoCD auto-sync → Kubernetes apply.
 
+## ArgoCD Cluster Bootstrap
+
+When a new AKS cluster is provisioned, ArgoCD and its supporting tooling are
+deployed entirely by Terraform (`terraform-infra/env/`) in a fixed dependency
+order. No manual `helm install` or `argocd` CLI steps are required.
+
+### Deployment sequence
+
+```mermaid
+flowchart TD
+    AKS["module.aks (AKS cluster)"]
+    NS["kubernetes_namespace\nargocd + sub-env namespaces"]
+    IC["kubectl_manifest\ninternal ingress controller\n(NginxIngressController)"]
+    ESO["helm_release.external_secrets\nExternal Secrets Operator"]
+    CSS["kubectl_manifest.key_vault_css\nClusterSecretStores\n(vozni-common-secrets-kv,\nvozni-common-tls-kv)"]
+    TLS["kubectl_manifest\nkorioclinical.com + korio.cloud\nTLS ExternalSecrets"]
+    REPO["kubectl_manifest.argocd_repo_es\nArgoCD repo credential\nExternalSecrets"]
+    ACD["helm_release.argo_cd\nArgoCD 7.7.1"]
+    APPS["helm_release.argocd_apps\nargocd-apps 2.0.2\n(bootstrap app-of-apps)"]
+    WH["kubernetes_ingress_v1\nargocd_webhook"]
+
+    AKS --> NS
+    AKS --> ESO
+    NS --> IC
+    IC --> ACD
+    ESO --> CSS
+    CSS --> TLS
+    CSS --> REPO
+    TLS --> ACD
+    REPO --> ACD
+    ACD --> APPS
+    ACD --> WH
+```
+
+**Step 1 — Namespaces** (`kubernetes_namespace.namespace`)
+
+All namespaces are created before any workloads, labeled
+`app.kubernetes.io/managed-by: terraform`. The set includes `argocd`
+plus every sub-environment namespace for the environment. ArgoCD appsets
+use `CreateNamespace=false`, so namespaces must pre-exist.
+
+**Step 2 — Internal ingress controller** (`kubectl_manifest.internal_ingress_controller`)
+
+Creates an AKS Web Application Routing `NginxIngressController` resource
+that provisions an internal (private) load balancer on the `aks-ingress-snet`
+subnet. ArgoCD's server ingress uses the internal ingress class
+(`internal.webapprouting.kubernetes.azure.com`). A 120-second
+`time_sleep` follows to allow the controller to fully start before
+dependent resources try to create Ingress objects.
+
+**Step 3 — External Secrets Operator** (`helm_release.external_secrets`)
+
+Deploys ESO (chart `external-secrets` 0.10.5) to the `external-secrets`
+namespace with Workload Identity enabled, allowing it to authenticate
+to Azure Key Vault without a stored credential.
+
+**Step 4 — ClusterSecretStores** (`kubectl_manifest.key_vault_css`)
+
+Creates two `ClusterSecretStore` resources that point to organisation-wide
+Key Vaults using `WorkloadIdentity` auth:
+
+| Secret store | Key Vault | Contents |
+|---|---|---|
+| `vozni-common-secrets-kv` | Organisation-wide secrets KV | GitHub App credentials for ArgoCD repo sync |
+| `vozni-common-tls-kv` | Organisation-wide TLS KV | Wildcard TLS certificates |
+
+**Step 5 — TLS certificate ExternalSecrets**
+
+`ExternalSecret` resources are created in every namespace. They pull
+`{environment}-korioclinical-com-pfx` and `{environment}-korio-cloud-pfx`
+from `vozni-common-tls-kv` and create `korio-tls` and `internal-korio-tls`
+Kubernetes secrets. ArgoCD's ingress TLS uses `korio-tls`.
+
+**Step 6 — ArgoCD repository credential ExternalSecrets**
+(`kubectl_manifest.argocd_repo_es`)
+
+Creates one `ExternalSecret` per tracked repository, all in the `argocd`
+namespace and labeled `argocd.argoproj.io/secret-type: repository` so
+ArgoCD picks them up automatically. Credentials come from the
+`argocd-repo-sync-github-app` secret in `vozni-common-secrets-kv`,
+which holds a GitHub App's app ID, installation ID, and private key.
+
+Repositories bootstrapped this way:
+- `korio-clinical/argocd` — ApplicationSet/Application definitions
+- `korio-clinical/kubernetes-manifests` — shared Helm chart
+- `korio-clinical/korio-helm` — supporting Helm resources
+
+**Step 7 — ArgoCD installation** (`helm_release.argo_cd`)
+
+Installs ArgoCD chart `7.7.1` from `https://argoproj.github.io/argo-helm`.
+Key values set at install time:
+
+| Setting | Value |
+|---|---|
+| Domain | `argocd-{env}.korioclinical.com` |
+| Server ingress | `internal.webapprouting.kubernetes.azure.com`, TLS via `korio-tls` |
+| `server.insecure` | `true` (TLS terminated at ingress, not at ArgoCD server) |
+| Admin account | Disabled |
+| Exec (terminal) | Enabled |
+| GitHub webhook secret | From `var.argocd_github_webhook_secret` |
+
+**SSO (Dex)**
+
+Two identity connectors are configured:
+
+| Connector | Type | Source |
+|---|---|---|
+| GitHub | `github` | `korio-clinical` org; teams listed per-environment in `locals.tf` |
+| Microsoft Entra | `microsoft` | Azure AD application created in `azure_applications.tf`; groups: `devops-team`, `Engineering`, `ClientServices` |
+
+The Azure AD application (`azuread_application.argocd_sso`) and its
+client secret are created by the same Terraform workspace and injected
+directly into the Helm release.
+
+**RBAC**
+
+Default policy is deny-all. Named policies grant:
+
+| Subject | Role | Scope |
+|---|---|---|
+| `devops-team` Entra group | `role:admin` | All |
+| `korio-clinical:devops` GitHub team | `role:admin` | All |
+| `{env}-argocd-users` Entra group | `role:user` | `apps/*` and `addons/*` |
+| `korio-clinical:deploy-{env}` GitHub team | `role:user` | `apps/*` and `addons/*` |
+| Dev/QA GitHub teams (per-env config) | `role:user` | `apps/*` and `addons/*` |
+
+`role:user` can view all projects, sync and restart application pods,
+and use the exec terminal. `role:admin` has full access.
+
+**Step 8 — Bootstrap applications** (`helm_release.argocd_apps`)
+
+Installs the `argocd-apps` chart `2.0.2`. This chart creates the two
+ArgoCD projects (`apps`, `addons`) and two bootstrap Application objects
+that complete the GitOps handoff from Terraform:
+
+| Application | Source path in `argocd` repo | Project | Manages |
+|---|---|---|---|
+| `apps` | `apps/{env}/` | `apps` | All microservice ApplicationSets |
+| `addons` | `addons/{env}/` | `addons` | Cluster add-ons (RabbitMQ, mock-SFTP, etc.) |
+
+Both applications run with `automated: {prune: true, selfHeal: true,
+allowEmpty: true}`. From this point forward, changes to the `argocd`
+repo automatically propagate to the cluster without any further Terraform
+involvement. See the `argocd` section in [Application Stack](application-stack.md#argocd-yaml)
+for the app-of-apps structure and ApplicationSet pattern.
+
+**Step 9 — Webhook ingress** (`kubernetes_ingress_v1.argocd_webhook`)
+
+Creates a public (external) ingress rule on `aks-{env}.korioclinical.com`
+that maps `/argocd/api/webhook` to `argocd-server:80`. This allows
+GitHub to push webhook events that trigger immediate ArgoCD syncs on
+`argocd` repo pushes, rather than waiting for the default polling interval.
+
+### Prerequisites before running `terraform apply`
+
+The following must exist before the Terraform workspace can complete
+successfully:
+
+| Prerequisite | Where to set it |
+|---|---|
+| `argocd_github_app_id` and `argocd_github_app_secret` | GitHub OAuth app registered in `korio-clinical` org; pass as Terraform variables |
+| `argocd_github_webhook_secret` | Arbitrary shared secret; set in GitHub repo webhook settings and as Terraform variable |
+| `argocd-repo-sync-github-app` Key Vault secret | GitHub App (app ID, installation ID, private key) stored in `vozni-common-secrets-kv` |
+| `{env}-korioclinical-com-pfx` and `{env}-korio-cloud-pfx` | Wildcard TLS certs in `vozni-common-tls-kv` |
+| Azure AD application for ArgoCD SSO | Created by `azure_applications.tf` in the same workspace — no manual action needed |
+
+### UI endpoints
+
+ArgoCD is accessible at `https://argocd-{env}.korioclinical.com` (VPN
+required; uses internal ingress). Login via GitHub SSO (requires
+`korio-clinical` org membership in the appropriate team) or Microsoft
+Entra SSO.
+
+| Environment | URL |
+|---|---|
+| dev | `https://argocd-dev.korioclinical.com` |
+| test | `https://argocd-test.korioclinical.com` |
+| platform | `https://argocd-platform.korioclinical.com` |
+| staging | `https://argocd-staging.korioclinical.com` |
+| prod | `https://argocd-prod.korioclinical.com` |
+| platform3 / staging3 / prod3 | `https://argocd-{env}.korioclinical.com` |
+
 ## Sub-environment Configuration
 
 ### Two independent sub-environment lists exist and can drift

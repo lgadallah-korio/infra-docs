@@ -292,9 +292,43 @@ CI: `.github/workflows/dagger-entrypoint.yml`
 
 ### argocd (YAML)
 
-ArgoCD Application and ApplicationSet definitions per environment in
-`apps/`. UIs at `https://argocd-{env}.korioclinical.com` (VPN
-required).
+ArgoCD Application and ApplicationSet definitions per environment.
+UIs at `https://argocd-{env}.korioclinical.com` (VPN required).
+For how ArgoCD itself is deployed and configured to a new AKS cluster,
+see [ArgoCD Cluster Bootstrap](infrastructure.md#argocd-cluster-bootstrap).
+
+**Repository layout**
+
+```
+argocd/
+├── apps/
+│   └── {env}/          # One directory per environment
+│       └── {subenv}/   # envfrom ConfigMaps per sub-environment
+├── addons/
+│   └── {env}/          # Cluster add-ons (RabbitMQ, mock-SFTP, etc.)
+└── templates/          # Shared NGINX ConfigMap/Service/Deployment/Ingress templates
+```
+
+**App-of-Apps pattern**
+
+Terraform bootstraps two root Applications via the `argocd-apps` Helm chart
+(see infrastructure.md). Those applications point at this repo and generate
+everything else:
+
+```
+argocd-apps (Helm, Terraform-managed)
+    apps Application      → apps/{env}/       → ApplicationSets per service
+    addons Application    → addons/{env}/     → RabbitMQ, mock-SFTP, etc.
+```
+
+The `apps/{env}/` directory contains one ApplicationSet YAML per service (or
+service version). Each ApplicationSet uses a `list` generator to expand
+deployments across sub-environments, with `valuesObject` inlining the image
+tag, env vars, and secret references for that service. korioctl generates and
+maintains these files — they are not edited by hand.
+
+All applications run with `prune: true` and `selfHeal: true`: ArgoCD
+continuously reconciles the cluster to match what is committed in this repo.
 
 ### kubernetes-manifests (Helm + Kustomize)
 
