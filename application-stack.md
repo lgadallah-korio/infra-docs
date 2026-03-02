@@ -333,15 +333,19 @@ continuously reconciles the cluster to match what is committed in this repo.
 ### kubernetes-manifests (Helm + Kustomize)
 
 Shared Helm chart at `helm/korio/` used by all application services.
-Kustomize overlays in `kustomize/`. **SFTP is deployed exclusively via
-Kustomize** (`kustomize/sftp-server/`) — the main Helm chart is not
-involved in SFTP at all.
+Kustomize overlays in `kustomize/`. Two services are deployed exclusively
+via Kustomize and are **not** managed through the Helm chart or
+presto-besto-manifesto:
+
+- **SFTP** (`kustomize/sftp-server/`) — see [SFTP](sftp.md)
+- **sas-api** (`kustomize/sas-api/`) — see [sas-api Deployment](#sas-api-deployment) below
 
 ```bash
 helm lint helm/korio/
 helm template helm/korio/ --values helm/korio/values.yaml
-kustomize build kustomize/overlays/dev/configure          # App services
-kustomize build kustomize/sftp-server/overlays/prod/accept  # SFTP
+kustomize build kustomize/overlays/dev/configure             # App services
+kustomize build kustomize/sftp-server/overlays/prod/accept   # SFTP
+kustomize build kustomize/sas-api/overlays/prod/my           # sas-api
 ```
 
 ### presto-besto-manifesto (YAML)
@@ -486,6 +490,128 @@ Per-service hardening (non-root UID, read-only root filesystem,
 writable `/tmp` emptyDir) is configured via the `deploy.securityContext`
 and `deploy.writeableTmpDir` values, which korioctl sets from the
 presto manifest's security configuration.
+
+## sas-api Deployment
+
+`sas-api` is a non-standard service. Unlike the ~50 other microservices
+that go through presto-besto-manifesto → korioctl → shared Helm chart,
+`sas-api` has its own bespoke Kustomize-based deployment maintained
+directly in `kubernetes-manifests` and `argocd/apps/`.
+
+### Comparison with standard microservices
+
+| Aspect | Standard microservices | sas-api |
+|---|---|---|
+| Manifest source | presto-besto-manifesto | Not in presto; manually maintained |
+| Kubernetes templating | Shared Helm chart (`helm/korio/`) | Custom Kustomize overlays |
+| YAML generation | korioctl (automated) | Hand-authored |
+| Image pin mechanism | `valuesObject.image.tag` in ApplicationSet | `kustomize.images[]` override in ApplicationSet |
+
+### ArgoCD ApplicationSets
+
+There is one `sas-api.yaml` ApplicationSet per environment in
+`argocd/apps/{env}/`. Each one:
+
+- Uses a `list` generator to expand across a **subset** of
+  sub-environments (not all five are active in every environment —
+  e.g., dev only has `configure` and `validate`; prod has all five).
+- Points `source.path` at `kustomize/sas-api/overlays/{env}/{subenv}`
+  in the `kubernetes-manifests` repo (`targetRevision: main`).
+- Pins the image via the `kustomize.images` override rather than Helm
+  `valuesObject`:
+
+  ```yaml
+  source:
+    path: "kustomize/sas-api/overlays/prod/my"
+    kustomize:
+      images:
+        - korio.azurecr.io/sas-api=korio.azurecr.io/sas-api:<git-sha>
+  ```
+
+- Uses `prune: true` + `selfHeal: true`, consistent with all other
+  ArgoCD apps.
+
+### Sub-environment coverage per environment
+
+| Environment | Sub-environments |
+|---|---|
+| dev | configure, validate |
+| test | configure, validate, my |
+| platform | configure, preview, validate |
+| staging | preview, validate |
+| prod | configure, preview, validate, accept, my |
+
+### Kustomize structure
+
+```
+kustomize/sas-api/
++-- base/
+|   +-- kustomization.yaml   # References deployment.yaml + service.yaml
+|   +-- deployment.yaml      # Deployment spec (image, resources, env)
+|   +-- service.yaml         # ClusterIP Service
++-- overlays/
+    +-- {env}/{subenv}/
+        +-- kustomization.yaml  # Sets namespace; image override applied
+                                # by ArgoCD at the ApplicationSet level
+```
+
+**Base Deployment key facts:**
+
+- Container port `5000`, Service port `8080` (ClusterIP)
+- Env var `SAS_HOME=/opt/SAS/SASHomeMinimal` — the container wraps a
+  SAS analytics runtime, which explains the heavier resource spec
+- Resource requests: 2 Gi RAM / 1 CPU; limits: 4 Gi / 2 CPU
+- Base image defaults to `korio.azurecr.io/sas-api:latest`; the actual
+  pinned SHA is injected by ArgoCD via `kustomize.images` in the
+  ApplicationSet, not in the overlay itself
+
+**Overlays** are minimal — each one sets only the `namespace` field to
+the target sub-environment name and pulls in the base.
+
+### CI/CD workflows and deploy triggers
+
+Each environment has its own workflow file in `.github/workflows/` in
+the `sas-api-docker` repo (all managed by Terraform). Every workflow
+delegates to the same reusable workflow:
+`korio-clinical/github-reusable-workflows/.github/workflows/deploy.yml`.
+
+The trigger differs per environment:
+
+| Environment | Trigger | Tag pattern |
+|---|---|---|
+| dev | Push to `main` or `workflow_dispatch` | n/a |
+| test | `workflow_dispatch` only | n/a |
+| platform, platform3, sandbox | `workflow_dispatch` only | n/a |
+| staging | Push tag | `X.Y.Z-rcN` or `release/*/X.Y.Z-rcN` |
+| staging3 | Push tag | `recodeX.Y.Z-rcN` |
+| prod | Push tag | `X.Y.Z` or `release/*/X.Y.Z` |
+| prod3 | Push tag | `recodeX.Y.Z` |
+
+**dev** is the only environment that deploys automatically (on merge to
+`main`). All other environments require a manual action.
+
+**staging and prod** are triggered by pushing a git tag — in practice
+this means creating a GitHub Release (which creates the tag). Use a
+release candidate tag (e.g. `1.2.3-rc1`) to deploy to staging; promote
+to a plain semver tag (e.g. `1.2.3`) to deploy to prod.
+
+**test, platform, sandbox** are triggered via `workflow_dispatch` —
+navigate to the workflow in the GitHub Actions UI and click "Run
+workflow".
+
+### Updating manifests
+
+Because `sas-api` is outside presto-besto-manifesto, the ArgoCD
+ApplicationSet and Kustomize manifests must be updated manually:
+
+1. **`argocd/apps/{env}/sas-api.yaml`** — update the SHA in the
+   `kustomize.images` override after a new image has been built and
+   pushed to ACR.
+2. **`kubernetes-manifests` (`kustomize/sas-api/`)** — update base or
+   overlay manifests if the Deployment spec itself needs to change
+   (resources, env vars, ports, etc.).
+
+There is no dagger-presto or korioctl automation for this service.
 
 ## Microservice Deployment Lifecycle
 

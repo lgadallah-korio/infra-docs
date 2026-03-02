@@ -5,6 +5,69 @@ Kustomize manifests in `kubernetes-manifests`) form one cohesive
 deployment unit. Understanding how they connect is essential before
 modifying any of them.
 
+## Architecture Overview
+
+The diagram below shows the full runtime topology, the Azure identity
+chain, and the configuration sources that drive it.
+
+Solid arrows = data flow. Dashed arrows = authentication / RBAC grants.
+Double arrows = configuration pushed at deploy time.
+
+```mermaid
+graph TB
+    SP(["Sponsor / Client\nSSH key auth"])
+
+    subgraph Pod["sftp-server Pod  --  AKS  {env} / {subenv}  namespace"]
+        I1["ssh-keys-init  [init]\nchmod SSH keys from ConfigMap"]
+        I2["sftp-acl-init  [init, one per integration]\ncreate dirs + POSIX ACLs on PV"]
+        SRV["sftp-server  [main]\nOpenSSH daemon, chroot-jailed per user"]
+        DS["sftp-data-sync  [sidecar, one per integration]\nwatch dirs, sync to Azure, publish events"]
+        I1 -->|init before| SRV
+        I2 -->|init before| SRV
+    end
+
+    PV[("Azure Disk PVC  64 Gi\n/mnt/sftp-data\n{env}/{subenv}/{sponsor}/{integration}/...")]
+
+    subgraph AzStorage["Azure Storage"]
+        MIR[("{env}sftpmirror  ADLS2\ncontainer: mirror\n{env}/{subenv}/{sponsor}/{integration}/...")]
+        ARC[("{env}sftparchive\ncontainer: archive")]
+    end
+
+    subgraph AzId["Azure Workload Identity  --  one set per sub-env"]
+        UAMIS["UAMI + FIC\n{env}-{sbenv}-sftp-server\nTerraform-managed\nPrincipal ID in DLDP ACLs\nClient ID in serviceAccount.yaml"]
+        UAMIC["UAMI + FIC\n{env}-{sbenv}-{service}\nmanually provisioned via korioctl\nPrincipal ID in DLDP ACLs\nClient ID in identities.yaml"]
+    end
+
+    RMQ(("RabbitMQ\nsftp-in / sftp-out\nqueues"))
+
+    BE["int-*-node\ndownstream services\ne.g. biostats, nest, CluePoints"]
+
+    subgraph Cfg["Configuration"]
+        KM["kubernetes-manifests\nKustomize overlays\netc-passwd/group, SSH keys, patch files"]
+        PBM["presto-besto-manifesto\nidentities.yaml\nserviceAccount + workloadId per sub-env"]
+        KV["Azure Key Vault\n{env}-{sbenv}  or  vozni-prod-{sbenv}\nSSH host keys | RabbitMQ URL | etc-shadow"]
+    end
+
+    SP -->|"SFTP / port 22"| SRV
+    SRV <-->|"read / write files"| PV
+    DS -->|"watch"| PV
+    DS -->|"mirror files"| MIR
+    DS -->|"archive files"| ARC
+    DS -->|"file-arrival events"| RMQ
+    RMQ -->|"outbound file events"| BE
+    BE <-->|"read / write files"| MIR
+
+    SRV -.->|"authenticates as"| UAMIS
+    DS -.->|"authenticates as"| UAMIS
+    UAMIS -.->|"Storage Blob Data Contributor"| MIR
+    BE -.->|"authenticates as"| UAMIC
+    UAMIC -.->|"Storage Blob Data Contributor"| MIR
+
+    KM ==>|"Kustomize build -> ArgoCD sync"| Pod
+    PBM ==>|"workload identity client IDs"| Pod
+    KV ==>|"ExternalSecrets Operator"| Pod
+```
+
 ## Key Repos and Commands
 
 ### sftp-server-docker (Docker)
@@ -81,7 +144,14 @@ uses **Azure Workload Identity**, which involves three components:
   its ACLs in one step. If skipped, `sftp-data-sync` fails silently — the
   directory doesn't exist and the service has no permission to create it.
   ACLs use the UAMI's **Principal ID** (not Client ID — these are
-  different UUIDs for the same identity).
+  different UUIDs for the same identity). The command takes two ACL
+  sets: `-p` (ParentACL — the default/inherited ACL for new child paths)
+  and `-l` (LeafACL — the ACL on the directory being created). Both must
+  be specified; the code does not derive defaults automatically. Four
+  principals appear in every leaf ACL: the `sftp-server` UAMI and the
+  client service UAMI (both get `rwx`), plus the per-environment Entra AD
+  security groups `sftp-read-{env}` (read-only humans, `r-x`) and
+  `sftp-read-write-{env}` (read-write humans, `rwx`).
 
 ### Runtime data flow
 
@@ -125,7 +195,8 @@ kubernetes-manifests/kustomize/sftp-server/
             │   ├── int-{name}.yaml          # ACL init + data-sync sidecar
             │   ├── humanHomedirs.yaml        # Home dir subPath mounts
             │   ├── loadbalancerIp.yaml
-            │   └── persistentVolume.yaml
+            │   ├── persistentVolume.yaml
+            │   └── serviceAccount.yaml      # Workload identity client ID for pod
             └── generators/        # Files baked into ConfigMaps/Secrets
                 ├── etc-passwd     # Unix user DB (defines UIDs)
                 ├── etc-group      # Unix group DB (defines GIDs)
@@ -541,7 +612,151 @@ per new user:
 
 ---
 
+### Azure Identity Provisioning (UAMI/FIC/DLDP)
+
+The Kubernetes manifest changes above wire up the container side. These
+steps provision the Azure identity chain that allows the pod to
+authenticate to storage. Perform them once per integration per
+sub-environment, alongside the manifest changes.
+
+**Prerequisites** — your account needs these IAM roles on the target
+`{env}sftpmirror` storage account:
+
+- Storage Blob Data Owner
+- Security Admin
+
+**Set up environment variables:**
+
+```bash
+export sub_id="<subscription-id>"
+export kenv="<env>"                           # dev, test, staging, prod, etc.
+export sftp_rg="vozni-${kenv}-sftp-storage"   # resource group for SFTP identities
+export study="<service-name>"                 # e.g. int-icsf-node
+```
+
+#### Create UAMIs
+
+Check which UAMIs already exist:
+
+```bash
+az identity list -g "${sftp_rg}" \
+  --query "[?type == 'Microsoft.ManagedIdentity/userAssignedIdentities'].{Name:name, ClientID:clientId, PrincipalID:principalId}" \
+  --output table | grep "${study}"
+```
+
+Create any that are missing (one per sub-environment):
+
+```bash
+cat "${kenv}/subenvironments.yaml"   # confirm active sub-environments
+for sbenv in configure validate preview; do
+  korioctl azure uami create -g "${sftp_rg}" "${kenv}-${sbenv}-${study}"
+done
+```
+
+#### Create FICs
+
+Get the AKS OIDC issuer URL:
+
+```bash
+export oidc_url="$(basename $(az aks show \
+  -g "vozni-${kenv}-rg" \
+  --name "vozni-${kenv}-aks" \
+  --query "oidcIssuerProfile.issuerUrl" \
+  -otsv 2>/dev/null))"
+```
+
+Create one FIC per sub-environment:
+
+```bash
+for sbenv in configure validate preview; do
+  korioctl azure fic create \
+    -g "${sftp_rg}" \
+    --identity "${kenv}-${sbenv}-${study}" \
+    --issuer "https://eastus.oic.prodaks.azure.com/${sub_id}/${oidc_url}/" \
+    --subject "system:serviceaccount:${sbenv}:${kenv}-${sbenv}-${study}" \
+    "${kenv}-${sbenv}-${study}"
+done
+```
+
+#### Create DLDPs
+
+Gather the four Principal IDs needed for the leaf ACLs (note: these are
+**Principal IDs**, not Client IDs — see the warning below):
+
+```bash
+# sftp-server UAMI principal ID (look up per sub-environment)
+export sftp_srv_id="$(az identity list | \
+  jq -r '.[] | "\(.name) \(.principalId)"' | \
+  grep "^${kenv}-${sbenv}-" | sort | grep 'sftp-server' | awk '{print $2}')"
+
+# client service UAMI principal ID
+export client_srv_id="$(az identity list | \
+  jq -r '.[] | "\(.name) \(.principalId)"' | \
+  grep "^${kenv}-${sbenv}-" | sort | grep "${study}" | awk '{print $2}')"
+
+# Entra AD read group (per environment)
+export sftp_ro_id="$(az ad group show -g "sftp-read-${kenv}" | jq -r '.id')"
+
+# Entra AD read-write group (per environment)
+export sftp_rw_id="$(az ad group show -g "sftp-read-write-${kenv}" | jq -r '.id')"
+```
+
+> **Principal ID vs Client ID**: They are different UUIDs for the same
+> identity. DLDPs always require the **Principal ID**. A common mistake
+> is accidentally passing the Client ID — the ACL entry is accepted but
+> never resolves to a named principal. In the Azure Portal Storage
+> Browser under "Manage ACL", a valid Principal ID resolves to the
+> principal's display name; a Client ID shows only the bare GUID.
+
+Create the Data Lake directory path (run once per subdirectory that
+`sftp-data-sync` watches):
+
+```bash
+korioctl azure dldp create \
+  -a "${kenv}sftpmirror" \
+  -f mirror \
+  -p user::rwx -p group::r-x -p other::--x \
+  -l user::r-x -l group::r-x -l other::--- \
+  -l "user:${sftp_srv_id}:rwx" \
+  -l "user:${client_srv_id}:rwx" \
+  -l "group:${sftp_ro_id}:r-x" \
+  -l "group:${sftp_rw_id}:rwx" \
+  -l mask::rwx \
+  "${kenv}/${sbenv}/${sponsor}/${integration}/${study-dir}/${subdir}"
+```
+
+The `-p` flags set the **ParentACL** (default ACL inherited by newly
+created child paths). The `-l` flags set the **LeafACL** (ACL on the
+directory being created, where `sftp-data-sync` reads and writes).
+Both must always be specified explicitly.
+
+#### Update Presto Identity Config
+
+After UAMIs exist, register the **Client ID** (not Principal ID) in
+`presto-besto-manifesto`:
+
+```bash
+# Get the Client ID for the service UAMI
+az identity list | \
+  jq -r '.[] | "\(.name) \(.clientId)"' | \
+  grep "^${kenv}-${sbenv}-" | sort | grep "${study}"
+```
+
+In `presto-besto-manifesto/${kenv}/presto_conf/.internal/${sbenv}/identities.yaml`,
+add an entry to the `identityConfig` dictionary:
+
+```yaml
+identityConfig:
+  <service-name>:                              # e.g. int-icsf-node
+    serviceAccount: ${kenv}-${sbenv}-${study}
+    workloadId: <client-id>                    # Client ID, NOT Principal ID
+```
+
+---
+
 ### Checklist
+
+**Kubernetes manifests (`kubernetes-manifests`):**
 
 - [ ] Collected all data items 1–11 above
 - [ ] UIDs and GIDs assigned and recorded (consistent across all target overlays)
@@ -553,9 +768,276 @@ per new user:
 - [ ] `patches/humanHomedirs.yaml` updated for any human users
 - [ ] `kustomization.yaml` updated (ssh-public-keys entries + patches list)
 - [ ] `kustomize build` runs cleanly against the overlay
+
+**Azure identity provisioning:**
+
+- [ ] UAMI created (or confirmed existing) for each sub-environment via `korioctl azure uami create`
+- [ ] FIC created for each sub-environment via `korioctl azure fic create`
+- [ ] DLDP created for each watched subdirectory via `korioctl azure dldp create` (using Principal IDs)
+- [ ] Principal IDs confirmed correct in Azure Portal Storage Browser (resolve to display names, not bare GUIDs)
+
+**Presto identity config (`presto-besto-manifesto`):**
+
+- [ ] `identities.yaml` updated for each sub-environment (using Client ID, not Principal ID)
+
+**Validation:**
+
 - [ ] Pod restarted so `sftp-acl-init` creates the directory tree and applies ACLs
 - [ ] Directories verified in `{env}sftpmirror` via `az storage fs directory list`
 - [ ] SFTP login tested with the service account key
+
+## Promoting SFTP Between Environments
+
+Promoting copies a Kustomize overlay to the next environment and rewrites
+all environment-specific values (env names, sub-env names, IP addresses,
+workload IDs, Key Vault secrets). All commands run from
+`kustomize/sftp-server/overlays/` in the `kubernetes-manifests` repo.
+
+Sub-environment sets differ per environment:
+
+| Environment | Sub-environments |
+|-------------|-----------------|
+| dev | configure, validate, my |
+| test | configure, validate, my |
+| platform | configure, validate, preview |
+| staging | configure, validate, preview |
+| prod | configure, accept, my |
+
+Key Vault names follow `{env}-{subenv}` for all environments except prod,
+which uses `vozni-prod-{subenv}`.
+
+### dev -> test
+
+```bash
+# 1. Sync dev overlay to test
+rsync -avh --delete dev/ test/
+
+# 2. Create sub-envs present in test but not dev (check presto-besto-manifesto/test/subenvironments.yaml)
+rsync -avh test/validate/ test/my/
+
+# 3. Replace env name in patches
+for sbenv in configure validate my; do
+  find test/${sbenv}/patches -type f -exec sed -i '' s/dev/test/g {} \;
+done
+
+# 4. Fix any integration slugs that happen to contain the env name (check output carefully)
+for sbenv in configure validate my; do
+  find test/${sbenv}/patches -type f -exec sed -i '' s/dtestincentz/ddevincentz/g {} \;
+done
+
+# 5. Fix sub-env name inside the new my/ directory
+find test/my -type f -exec sed -i '' s/validate/my/g {} \;
+
+# 6. Fix load balancer IP addresses
+for sbenv in configure validate my; do
+  ipAddr="$(dig +short ${sbenv}-test-sftp.korioclinical.com)" \
+  yq -i '.[0].value = env(ipAddr)' test/${sbenv}/patches/loadbalancerIp.yaml
+done
+
+# 7. Fix workload IDs (sftp-server UAMI client ID per sub-environment)
+for sbenv in configure validate my; do
+  workloadId="$(az identity show \
+    --resource-group vozni-test-sftp-storage \
+    --name test-${sbenv}-sftp-server \
+    --query 'clientId' -otsv)" \
+  yq -i '.[0].value = env(workloadId)' test/${sbenv}/patches/serviceAccount.yaml
+done
+
+# 8. Sync /etc/shadow secret across Key Vaults
+az keyvault secret show --vault-name dev-configure --name sftp-etc-shadow \
+  | jq -r '.value' > /tmp/dev-configure-etc-shadow
+for sbenv in configure validate my; do
+  az keyvault secret set \
+    --vault-name test-${sbenv} \
+    --name sftp-etc-shadow \
+    --file /tmp/dev-configure-etc-shadow
+done
+
+# 9. Verify build
+for sbenv in configure validate my; do
+  kustomize build test/${sbenv} || read PAUSE_ON_FAIL
+done
+
+# Optional: test user access
+sftp ${username}@validate-test-sftp.korioclinical.com
+```
+
+### test -> platform
+
+```bash
+# 1. Sync
+rsync -avh --delete test/ platform/
+
+# 2. Create sub-envs present in platform but not test (platform has preview, not my)
+rsync -avh platform/validate/ platform/preview/
+
+# 3. Remove sub-envs not in platform
+rm -rf platform/my
+
+# 4. Replace env name
+for sbenv in configure validate preview; do
+  find platform/${sbenv}/patches -type f -exec sed -i '' s/test/platform/g {} \;
+done
+
+# 5. Fix clobberings (check for integration slugs that contain the source env name)
+for sbenv in configure validate preview; do
+  find platform/${sbenv}/patches -type f -exec sed -i '' s/laplatform/latest/g {} \;
+done
+
+# 6. Fix sub-env name inside the new preview/ directory
+find platform/preview -type f -exec sed -i '' s/validate/preview/g {} \;
+
+# 7. Fix IP addresses
+for sbenv in configure validate preview; do
+  ipAddr="$(dig +short ${sbenv}-platform-sftp.korioclinical.com)" \
+  yq -i '.[0].value = env(ipAddr)' platform/${sbenv}/patches/loadbalancerIp.yaml
+done
+
+# 8. Fix workload IDs
+for sbenv in configure validate preview; do
+  workloadId="$(az identity show \
+    --resource-group vozni-platform-sftp-storage \
+    --name platform-${sbenv}-sftp-server \
+    --query 'clientId' -otsv)" \
+  yq -i '.[0].value = env(workloadId)' platform/${sbenv}/patches/serviceAccount.yaml
+done
+
+# 9. Sync /etc/shadow
+az keyvault secret show --vault-name test-validate --name sftp-etc-shadow \
+  | jq -r '.value' > /tmp/test-validate-etc-shadow
+for sbenv in configure validate preview; do
+  az keyvault secret set \
+    --vault-name platform-${sbenv} \
+    --name sftp-etc-shadow \
+    --file /tmp/test-validate-etc-shadow
+done
+
+# 10. Verify build
+for sbenv in configure validate preview; do
+  kustomize build platform/${sbenv} || read PAUSE_ON_FAIL
+done
+
+# Optional: test user access
+sftp ${username}@preview-platform-sftp.korioclinical.com
+```
+
+### platform -> staging
+
+```bash
+# 1. Sync — exclude files that must be set independently per environment
+rsync -avh --delete \
+  --exclude loadbalancerIp.yaml \
+  --exclude serviceAccount.yaml \
+  --exclude recode-pci \
+  --exclude persistentVolume.yaml \
+  --exclude moderna-biostats \
+  --exclude moderna-maestro \
+  platform/ staging/
+
+# 2. Replace env name
+for sbenv in configure validate preview; do
+  find staging/${sbenv}/patches -type f -exec sed -i '' s/platform/staging/g {} \;
+done
+
+# 3. Sync /etc/shadow
+az keyvault secret show --vault-name platform-preview --name sftp-etc-shadow \
+  | jq -r '.value' > /tmp/platform-preview-etc-shadow
+for sbenv in configure validate preview; do
+  az keyvault secret set \
+    --vault-name staging-${sbenv} \
+    --name sftp-etc-shadow \
+    --file /tmp/platform-preview-etc-shadow
+done
+
+# 4. Fix IP addresses
+for sbenv in configure validate preview; do
+  ipAddr="$(dig +short ${sbenv}-staging-sftp.korioclinical.com)" \
+  yq -i '.[0].value = env(ipAddr)' staging/${sbenv}/patches/loadbalancerIp.yaml
+done
+
+# 5. Fix workload IDs
+for sbenv in configure validate preview; do
+  workloadId="$(az identity show \
+    --resource-group vozni-staging-sftp-storage \
+    --name staging-${sbenv}-sftp-server \
+    --query 'clientId' -otsv)" \
+  yq -i '.[0].value = env(workloadId)' staging/${sbenv}/patches/serviceAccount.yaml
+done
+
+# 6. Verify build
+for sbenv in configure validate preview; do
+  kustomize build staging/${sbenv} || read PAUSE_ON_FAIL
+done
+
+# Optional: test user access
+sftp ${username}@validate-staging-sftp.korioclinical.com
+```
+
+### staging -> prod
+
+Prod has a different sub-environment set (`configure`, `accept`, `my`) and
+uses a different Key Vault naming convention (`vozni-prod-{subenv}`).
+
+```bash
+# 1. Sync — exclude SSH public keys (sponsors may have prod-specific keys)
+rsync -avh --delete \
+  --exclude '*generators/ssh-public-keys/*' \
+  staging/ prod/
+
+# 2. Create prod-specific sub-envs (accept, my) from validate
+for sbenv in accept my; do
+  rsync -avh --delete \
+    --exclude '*generators/ssh-public-keys/*' \
+    prod/validate/ prod/${sbenv}/
+done
+
+# 3. Fix sub-env names in the new directories
+for sbenv in accept my; do
+  find prod/${sbenv} -type f -exec sed -i '' s/validate/${sbenv}/g {} \;
+done
+
+# 4. Replace env name throughout prod
+find prod/ -type f -exec sed -i '' s/staging/prod/g {} \;
+
+# 5. Remove sub-envs not present in prod
+rm -rf prod/preview/ prod/validate/
+
+# 6. Fix Maestro integration's leaf directory name (Test -> Prod)
+sed -i '' s/Test/Prod/g prod/my/patches/int-maestro.yaml
+
+# 7. Sync /etc/shadow (note: prod Key Vault names use vozni-prod-{subenv})
+az keyvault secret show --vault-name staging-validate --name sftp-etc-shadow \
+  | jq -r '.value' > /tmp/staging-validate-etc-shadow
+for sbenv in configure accept my; do
+  az keyvault secret set \
+    --vault-name vozni-prod-${sbenv} \
+    --name sftp-etc-shadow \
+    --file /tmp/staging-validate-etc-shadow
+done
+
+# 8. Fix IP addresses
+for sbenv in configure accept my; do
+  ipAddr="$(dig +short ${sbenv}-prod-sftp.korioclinical.com)" \
+  yq -i '.[0].value = env(ipAddr)' prod/${sbenv}/patches/loadbalancerIp.yaml
+done
+
+# 9. Fix workload IDs
+for sbenv in configure accept my; do
+  workloadId="$(az identity show \
+    --resource-group vozni-prod-sftp-storage \
+    --name prod-${sbenv}-sftp-server \
+    --query 'clientId' -otsv)" \
+  yq -i '.[0].value = env(workloadId)' prod/${sbenv}/patches/serviceAccount.yaml
+done
+
+# 10. Verify build
+for sbenv in configure accept my; do
+  kustomize build prod/${sbenv} || read PAUSE_ON_FAIL
+done
+
+# Optional: test user access
+sftp ${username}@sftp.korioclinical.com
+```
 
 ## Troubleshooting
 
@@ -697,6 +1179,7 @@ the RBAC layer (still subject to POSIX ACLs within the container).
 | Expected directories don't exist in `{env}sftpmirror` | `sftp-acl-init` failed or was never added for this integration | Init container logs via `kubectl logs`; `kustomization.yaml` patch list |
 | ACLs look correct in manifests but wrong in Azure | Pod hasn't been restarted since the patch was applied (init containers only run at pod start) | Restart the sftp-server pod to re-run all `sftp-acl-init` containers |
 | `dagger-presto` CI check fails when enabling a new sub-environment | A service's env var file in the new sub-env directory is missing keys that exist in other sub-envs | See §4 below |
+| Messages accumulate in an SFTP outbound queue but are never consumed | `sftp-data-sync` stalled after encountering a malformed message | See §5 below |
 
 ---
 
@@ -738,3 +1221,47 @@ sub-environment.
 
 The validation only checks that key **names** match across sub-envs — the
 values can (and should) differ where appropriate.
+
+---
+
+### 5. Stuck SFTP outbound queue (RabbitMQ message re-injection)
+
+If messages accumulate in an outbound queue (e.g. `int-maestro-sftp-out`,
+`int-pci-sftp-out`) but the count does not drain, `sftp-data-sync` has
+likely stalled after encountering a malformed message it could not parse.
+
+**Access RabbitMQ:** Browse to `rabbitmq-my.prod.korio.cloud` (requires
+Twingate VPN). Credentials `rabbitmq-testuser` / `rabbitmq-test-password`
+are in the `vozni-common-secrets-kv` Key Vault.
+
+**Diagnosis:** In the Queues and Streams page, click the stalled queue.
+Under "Get messages", set Ack Mode to `Nack message requeue true` and
+click Get Message(s). Inspect the Payload field of each message.
+
+**If payloads are valid JSON:** A pod restart is sufficient — delete the
+`sftp-server-*` pod in the `sftp-server-my` ArgoCD application
+(`argocd-prod.korioclinical.com`). The pod is automatically redeployed;
+`sftp-data-sync` will pick up the queued messages on startup.
+
+**If payloads are byte-buffer encoded** (`{"type":"Buffer","data":[...]}`
+containing an array of integers rather than a JSON string):
+
+1. Note the current message count.
+2. Switch Ack Mode to `Automatic ack` and click Get Message(s) — this
+   **permanently deletes** the messages from the queue.
+3. For each message, decode the integer array back to its JSON string
+   (each integer is a character code — `chr(n)` in Python).
+4. Re-publish each decoded string via the "Publish message" section:
+   set Payload encoding to `String (default)` and Delivery mode to
+   `Persistent`, then paste the JSON string and click Publish message.
+5. Verify the queue shows the expected number of new messages.
+6. Delete the `sftp-server-*` pod in ArgoCD so `sftp-data-sync` restarts
+   and processes the corrected messages.
+7. Confirm in the ArgoCD pod logs (`sftp-data-sync` container) that the
+   messages were consumed, and that the queue returns to zero.
+
+> The byte-encoding root cause (a publisher encoding messages as a
+> `Buffer` object instead of a JSON string) and the `sftp-data-sync`
+> channel-close bug that prevented recovery were both fixed in
+> September 2024. If byte-encoded messages reappear, investigate the
+> publishing service before resorting to the manual workaround above.
