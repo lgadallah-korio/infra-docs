@@ -374,6 +374,10 @@ Common causes:
 | `Missing` resource | Namespace doesn't exist | Check C1 |
 | `Degraded` pod | Workload identity failure (UAMI/FIC) | Check B2, B3 |
 | `sftp-data-sync` errors | DLDP paths/ACLs wrong | Check B4 |
+| No apps visible for `${sbenv}` in ArgoCD at all | Sub-env missing from `subenvironments.yaml` | Check A1 — see argocd-sync-failures runbook Phase 0 |
+| `Progressing` / pods stuck `Pending` | Cluster out of resources | See argocd-sync-failures runbook Phase 4 |
+| `Degraded` pod with `ImagePullBackOff` | Image tag missing or incorrect | See argocd-sync-failures runbook Phase 5 |
+| Deployment appears to fail but old pod still `Running` or `Terminating` | Rolling update in progress, not a real failure | Wait for termination, or force-delete old pod (see argocd-sync-failures Step 1d) |
 
 ---
 

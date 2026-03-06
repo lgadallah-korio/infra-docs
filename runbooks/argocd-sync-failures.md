@@ -80,6 +80,60 @@ This commonly occurs when a service uses a feature branch (rather than
 `release/MP-1` or a semver tag) that is still in development and may have
 template bugs or unmet dependencies.
 
+**Failure mode 3 — Cluster resource exhaustion (pods stuck Pending)**
+
+The AKS node pool may not have sufficient CPU or memory to schedule new pods.
+When this happens, pods remain in `Pending` state indefinitely. ArgoCD health
+checks detect the unscheduled pods and mark the Application `Progressing` (and
+eventually `Degraded` if the rollout deadline is exceeded). Sync status may
+show `Synced` — the desired state was applied to the API server successfully —
+but the workload is not actually running.
+
+This commonly occurs after a wave of new sub-environment activations (e.g.
+enabling `staging-validate` alongside other sub-envs) where the combined
+resource requests of all new pods exceed available node capacity.
+
+**Failure mode 4 — Image pull failure / incorrect image reference**
+
+If the container image tag referenced in the AppSet does not exist in the
+registry, or exists but is inaccessible, pods will fail to start with
+`ImagePullBackOff` or `ErrImagePull`. ArgoCD marks the Application `Degraded`.
+
+A related case: an image tag that exists in the registry but refers to the
+wrong build (e.g. a stale tag, a branch that never built successfully, or a
+tag that was overwritten). The pod starts from ArgoCD's perspective, but the
+running container is not the intended version. This can make a deployment
+appear to succeed while actually running incorrect code, or appear to fail
+when the image reference simply needs to be corrected.
+
+---
+
+## Phase 0: Pre-check — verify the sub-environment is activated
+
+Before diagnosing individual application failures, confirm that the
+sub-environment is actually registered in the presto-besto-manifesto pipeline.
+If it is not, no ArgoCD Applications will exist for it — there is nothing to
+sync or heal.
+
+```bash
+grep -w "${sbenv}" "presto-besto-manifesto/${kenv}/subenvironments.yaml"
+```
+
+**Expected:** a line containing `- ${sbenv}`.
+
+If this returns no output, the sub-environment has never been activated in the
+Dagger pipeline. All downstream symptoms (missing apps, nothing in ArgoCD for
+this sub-env) are a consequence of this single missing entry — do not proceed
+to Phase 1 until it is fixed.
+
+**Fix:** add `${sbenv}` to `presto-besto-manifesto/${kenv}/subenvironments.yaml`,
+open a PR, and merge it. The Dagger pipeline will run automatically and open a
+follow-up PR on the `argocd` repo to add `${sbenv}` to all AppSets. Merge that
+PR too, then return to Phase 1.
+
+See also: `validate-subenv-config.md` check A1 and Phase 3a of the
+sub-environment enable runbook for the full activation sequence.
+
 ---
 
 ## Phase 1: Identify the failure mode
@@ -105,7 +159,8 @@ Look at the output for:
 
 | `sync.status` | `health.status` | Most likely cause |
 |---|---|---|
-| `Synced` | `Degraded` | Failure mode 1 (ExternalSecret error) |
+| `Synced` | `Degraded` | Failure mode 1, 3, or 4 — check pod events first (Step 1d) |
+| `Synced` | `Progressing` | Failure mode 3 (cluster resource exhaustion — pod Pending) |
 | `OutOfSync` | Any | Failure mode 1 or 2 — check for rendering error first |
 | `Unknown` | Any | Failure mode 2 (Helm rendering error) |
 | `SyncFailed` | Any | Failure mode 2 (Helm rendering error) |
@@ -148,6 +203,41 @@ argocd app get "${app}" --server <argocd-server-for-${kenv}> \
 kubectl get application "${app}" -n argocd --context "${kenv}" -o jsonpath \
   '{.status.conditions[*].message}'
 ```
+
+---
+
+### Step 1d: Check pod events (for Degraded or Progressing apps)
+
+If the app is `Degraded` or `Progressing` and the ExternalSecret check (1b)
+found no errors, inspect the pod directly:
+
+```bash
+# List pods for the service in the target namespace:
+kubectl get pods -n "${sbenv}" --context "${kenv}" | grep "${svc}"
+
+# Describe the pod to see scheduling and container events:
+kubectl describe pod -n "${sbenv}" --context "${kenv}" \
+  -l "app.kubernetes.io/name=${svc}" | tail -30
+```
+
+Look at the `Events:` section at the bottom:
+
+| Event message | Failure mode | Next step |
+|---|---|---|
+| `0/N nodes available: insufficient cpu/memory` | Failure mode 3 (cluster resources) | Phase 4 |
+| `Back-off pulling image` / `ImagePullBackOff` | Failure mode 4 (image pull) | Phase 5 |
+| `Failed to pull image ... not found` | Failure mode 4 (image does not exist) | Phase 5 |
+| `Error: secret ... not found` | Failure mode 1 (Key Vault) | Phase 2 |
+| Pod already exists / `Terminating` (old pod present) | Previous rollout not yet complete | Wait, or force-delete the old pod |
+
+> **Note — existing pod from a prior deployment:** If `kubectl get pods` shows
+> a pod in `Terminating` or `Running` state with an older image while a new
+> pod is `Pending` or `ContainerCreating`, the deployment is mid-rollout, not
+> failed. Wait for the termination grace period to complete. If the old pod is
+> stuck `Terminating`, force-delete it:
+> ```bash
+> kubectl delete pod <pod-name> -n "${sbenv}" --context "${kenv}" --grace-period=0 --force
+> ```
 
 Also check which `targetRevision` the AppSet uses:
 
@@ -355,7 +445,115 @@ pick up the new `targetRevision` on the next poll cycle.
 
 ---
 
-## Phase 4: Verify the fix
+## Phase 4: Fix — cluster resource exhaustion
+
+### Step 4a: Confirm pods are Pending due to resources
+
+```bash
+# Identify Pending pods:
+kubectl get pods -n "${sbenv}" --context "${kenv}" | grep Pending
+
+# Confirm the reason is resource pressure (look for "Insufficient" in Events):
+kubectl describe pod <pending-pod-name> -n "${sbenv}" --context "${kenv}" \
+  | grep -A 5 "Events:"
+```
+
+Expected output will include lines like:
+```
+Warning  FailedScheduling  ...  0/3 nodes are available: 3 Insufficient cpu.
+```
+
+### Step 4b: Check current node utilization
+
+```bash
+kubectl top nodes --context "${kenv}"
+# Shows current CPU/memory consumption per node vs. allocatable capacity
+
+kubectl describe nodes --context "${kenv}" | grep -A 5 "Allocated resources"
+# Shows how much of each node's allocatable capacity is already requested
+```
+
+### Step 4c: Scale up the AKS node pool
+
+Scale the node pool through the Azure Portal or CLI. Identify the AKS cluster
+and node pool name first:
+
+```bash
+az aks list -o table | grep "${kenv}"
+az aks nodepool list --cluster-name <cluster-name> \
+  --resource-group "vozni-${kenv}-aks-rg" -o table
+```
+
+Then scale:
+
+```bash
+az aks nodepool scale \
+  --cluster-name <cluster-name> \
+  --resource-group "vozni-${kenv}-aks-rg" \
+  --name <nodepool-name> \
+  --node-count <new-count>
+```
+
+Once new nodes are ready, the pending pods will be scheduled automatically
+within a few minutes. Monitor with:
+
+```bash
+watch kubectl get pods -n "${sbenv}" --context "${kenv}" | grep "${svc}"
+```
+
+---
+
+## Phase 5: Fix — image pull failure / incorrect image reference
+
+### Step 5a: Identify the failing image reference
+
+```bash
+# Get the image the pod is trying to pull:
+kubectl describe pod -n "${sbenv}" --context "${kenv}" \
+  -l "app.kubernetes.io/name=${svc}" | grep -E "Image:|Failed to pull"
+```
+
+Also check what the AppSet specifies:
+
+```bash
+grep "tag\|image" "argocd/apps/${kenv}/${svc}-appset.yaml"
+```
+
+### Step 5b: Verify the image tag exists in the registry
+
+Check whether the tag exists in the Azure Container Registry (ACR) or
+whichever registry is in use:
+
+```bash
+# List tags for the repository (replace <registry> and <repo> as appropriate):
+az acr repository show-tags \
+  --name <registry-name> \
+  --repository <image-repo> \
+  --orderby time_desc \
+  --top 10 \
+  -o tsv | grep "<expected-tag>"
+```
+
+If the tag is missing, the CI pipeline that builds and pushes the image either
+did not run or failed. Check the CI run for the relevant branch/commit in the
+service's repository.
+
+### Step 5c: Correct the image reference if wrong
+
+If the AppSet references the wrong tag or image, update it in
+`argocd/apps/${kenv}/${svc}-appset.yaml` (or in
+`presto-besto-manifesto/${kenv}/` if the image is managed by presto) and open
+a PR. Once merged, ArgoCD will pull the corrected image on the next sync.
+
+> If the image reference is correct but the tag was recently pushed and ArgoCD
+> has not re-synced yet, trigger a manual sync:
+> ```bash
+> argocd app sync "${app}" --server <argocd-server-for-${kenv}>
+> ```
+
+---
+
+## Phase 6: Verify the fix
 
 ```bash
 # Watch ArgoCD application status until Synced + Healthy:
@@ -404,13 +602,32 @@ ArgoCD Application not Synced/Healthy
             ├─ sync.status = Unknown / SyncFailed
             │    └─ Helm rendering error (Phase 3)
             │         Check: targetRevision points to feature branch?
-            │         Fix:  merge branch → release/MP-1 or pin to stable ref
+            │         Fix:  merge branch -> release/MP-1 or pin to stable ref
+            │
+            ├─ sync.status = Synced, health.status = Progressing
+            │    └─ Cluster resource exhaustion (Phase 4)
+            │         Check: kubectl describe pod ... | grep "Insufficient"
+            │         Fix:  az aks nodepool scale --node-count <new-count>
             │
             └─ sync.status = Synced, health.status = Degraded
-                 └─ ExternalSecret failure (Phase 2)
-                      Check: kubectl get externalsecret -n ${sbenv}
-                      Fix:   az keyvault secret set --vault-name ${kv_name}
-                                --name <MISSING-KEY> --value "placeholder"
+                 │
+                 ├─ Pod events show ImagePullBackOff / ErrImagePull
+                 │    └─ Image pull failure (Phase 5)
+                 │         Check: az acr repository show-tags ...
+                 │         Fix:  correct image tag in AppSet / trigger CI build
+                 │
+                 ├─ Pod events show "Insufficient cpu/memory"
+                 │    └─ Cluster resource exhaustion (Phase 4)
+                 │
+                 ├─ Old pod stuck Terminating, new pod Pending/ContainerCreating
+                 │    └─ Rolling update in progress (not a real failure)
+                 │         Fix:  wait, or force-delete stuck pod (Step 1d)
+                 │
+                 └─ ExternalSecret Ready=False / SecretSyncedError
+                      └─ Missing Key Vault secret (Phase 2)
+                           Check: kubectl get externalsecret -n ${sbenv}
+                           Fix:  az keyvault secret set --vault-name ${kv_name}
+                                    --name <MISSING-KEY> --value "placeholder"
 ```
 
 ---
@@ -432,3 +649,20 @@ No repo changes required.
 |---|---|---|
 | `kubernetes-manifests` | Feature branch | Merge to `release/MP-1` (or fix rendering bug) |
 | `argocd` | `apps/${kenv}/${svc}-appset.yaml` — `targetRevision` | Update to `release/MP-1` (or stable ref) |
+
+### Failure mode 3 — Cluster resource exhaustion
+
+| System | Resource | Action |
+|---|---|---|
+| AKS | Node pool | Scale up node count via `az aks nodepool scale` |
+
+No repo changes required.
+
+### Failure mode 4 — Image pull failure / incorrect image reference
+
+| System | Resource | Action |
+|---|---|---|
+| CI pipeline | Image build for `${svc}` | Trigger build / verify tag was pushed to registry |
+| `argocd` or `presto-besto-manifesto` | Image tag reference | Correct the tag and open a PR |
+
+No Azure resource changes required.
