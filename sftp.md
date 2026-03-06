@@ -34,8 +34,8 @@ graph TB
     end
 
     subgraph AzId["Azure Workload Identity  --  one set per sub-env"]
-        UAMIS["UAMI + FIC\n{env}-{sbenv}-sftp-server\nTerraform-managed\nPrincipal ID in DLDP ACLs\nClient ID in serviceAccount.yaml"]
-        UAMIC["UAMI + FIC\n{env}-{sbenv}-{service}\nmanually provisioned via korioctl\nPrincipal ID in DLDP ACLs\nClient ID in identities.yaml"]
+        UAMIS["UAMI + FIC\n{env}-{sbenv}-sftp-server\nTerraform-managed\nK8s SA: sftp-server\nPrincipal ID in DLDP ACLs\nClient ID in serviceAccount.yaml"]
+        UAMIC["UAMI + FIC\n{env}-{sbenv}-{service}\nmanually provisioned via korioctl\nK8s SA: {env}-{sbenv}-{service}\nPrincipal ID in DLDP ACLs\nClient ID in identities.yaml"]
     end
 
     RMQ(("RabbitMQ\nsftp-in / sftp-out\nqueues"))
@@ -634,6 +634,30 @@ export sftp_rg="vozni-${kenv}-sftp-storage"   # resource group for SFTP identiti
 export study="<service-name>"                 # e.g. int-icsf-node
 ```
 
+#### Identity naming conventions
+
+The UAMI, FIC, and Kubernetes ServiceAccount names follow different patterns
+for the sftp-server and client services:
+
+| | UAMI name | K8s ServiceAccount name | FIC subject |
+|---|---|---|---|
+| sftp-server (Terraform-managed) | `{env}-{subenv}-sftp-server` | `sftp-server` | `system:serviceaccount:{subenv}:sftp-server` |
+| client service (manually provisioned) | `{env}-{subenv}-{service-name}` | `{env}-{subenv}-{service-name}` | `system:serviceaccount:{subenv}:{env}-{subenv}-{service-name}` |
+
+For the sftp-server, the UAMI carries the full `{env}-{subenv}` prefix but the
+Kubernetes ServiceAccount is simply `sftp-server` — the same bare name in every
+namespace. For client services, the UAMI name and Kubernetes ServiceAccount name
+are the same string.
+
+The `{service-name}` component of client service identities has no established
+convention. Two patterns have been observed in practice:
+
+- `int-{integration}-node` — e.g. `int-biostats-node`, `int-nest-node`
+- `{sponsor}-{integration}-{role}` — e.g. `moderna-icsf-consumer`, `tagworks-pci-consumer`
+
+All UAMIs and FICs for both sftp-server and client services live in the
+`vozni-{env}-sftp-storage` resource group.
+
 #### Create UAMIs
 
 Check which UAMIs already exist:
@@ -654,6 +678,18 @@ done
 ```
 
 #### Create FICs
+
+The AKS cluster acts as an OpenID Connect (OIDC) token issuer: it signs
+each pod's Kubernetes ServiceAccount token with a cluster-specific key
+pair, and publishes the corresponding public keys at a well-known URL
+(`oidcIssuerProfile.issuerUrl`). When a pod exchanges its ServiceAccount
+token for an Azure access token, Azure AD fetches the cluster's public
+keys from that URL and verifies the token's signature. It then checks
+the token against the UAMI's FIC — if the FIC's `issuer` matches the
+signing URL and the FIC's `subject` matches the token's `sub` claim
+(`system:serviceaccount:{namespace}:{serviceaccount-name}`), the exchange
+succeeds. If no FIC exists, or either field is wrong, Azure AD rejects
+the request with `AADSTS70025`.
 
 Get the AKS OIDC issuer URL:
 
@@ -752,6 +788,62 @@ identityConfig:
     workloadId: <client-id>                    # Client ID, NOT Principal ID
 ```
 
+Each entry is keyed by the **service name** as used in the UAMI and Kubernetes
+ServiceAccount (e.g. `int-biostats-node`, `moderna-icsf-consumer`). The
+`serviceAccount` value is the full `{env}-{subenv}-{service-name}` string, which
+is both the Kubernetes ServiceAccount name and the UAMI name for that service.
+The `workloadId` is that UAMI's Client ID. See the naming conventions note in the
+provisioning section above for the two service-name patterns in use.
+
+#### Validate the identity chain
+
+Once the UAMI, FIC, and `identities.yaml` entry are in place, use
+`scripts/validate-sftp-identity.sh` to verify the complete Azure-side
+identity chain from a single command:
+
+```bash
+# Checks 1-3 only (no path-level ACL check)
+infra-docs/scripts/validate-sftp-identity.sh \
+  <serviceAccount> \
+  <workloadId>
+
+# All four checks including DLDP ACL validation for all leaf directories
+infra-docs/scripts/validate-sftp-identity.sh \
+  <serviceAccount> \
+  <workloadId> \
+  <sponsor> \
+  <integration>
+```
+
+When `<sponsor>` and `<integration>` are provided, check 4 lists all
+directories under `{env}/{subenv}/{sponsor}/{integration}` recursively,
+identifies the leaf directories (those created by `korioctl azure dldp
+create`), and checks the POSIX ACL on each one. Named ACL entries are
+set on leaf directories, not on intermediate parent directories — the
+script handles this automatically by filtering out any directory that is
+a prefix of another in the list.
+
+```bash
+infra-docs/scripts/validate-sftp-identity.sh \
+  staging-preview-int-biostats-node \
+  f0a9fda4-175d-479f-80f8-5bb9b6597a46 \
+  moderna \
+  biostats
+```
+
+The script runs four checks in sequence:
+
+| # | What is checked | Failure means |
+|---|----------------|---------------|
+| 1 | UAMI exists in `vozni-{env}-sftp-storage` and its Client ID matches `workloadId` | UAMI missing or `identities.yaml` has wrong Client ID |
+| 2 | A FIC exists on the UAMI with the correct subject (`system:serviceaccount:{subenv}:{serviceAccount}`) | FIC never created or subject is wrong — pod will fail with `AADSTS70025` |
+| 3 | RBAC role assignments for the UAMI on `{env}sftpmirror` (informational) | No hard failure — ADLS2 supports ACL-only OAuth2 access; check 4 is the definitive data-plane test |
+| 4 | All leaf directories under the integration path exist in `{env}sftpmirror/mirror`; each DLDP ACL includes the UAMI's Principal ID; and the owner ACL entry (`user::`) has write permission | Directory not created, ACL missing, or owner lacks write — `sftp-data-sync` cannot write |
+
+If `sponsor`/`integration` are omitted, check 4 instead lists the
+directories under `{env}/{subenv}` so you can identify the correct
+sponsor and integration slugs to pass on a subsequent run.
+
 ---
 
 ### Checklist
@@ -782,6 +874,7 @@ identityConfig:
 
 **Validation:**
 
+- [ ] Azure identity chain verified via `scripts/validate-sftp-identity.sh <serviceAccount> <workloadId> <sponsor> <integration>`
 - [ ] Pod restarted so `sftp-acl-init` creates the directory tree and applies ACLs
 - [ ] Directories verified in `{env}sftpmirror` via `az storage fs directory list`
 - [ ] SFTP login tested with the service account key
@@ -1180,6 +1273,7 @@ the RBAC layer (still subject to POSIX ACLs within the container).
 | ACLs look correct in manifests but wrong in Azure | Pod hasn't been restarted since the patch was applied (init containers only run at pod start) | Restart the sftp-server pod to re-run all `sftp-acl-init` containers |
 | `dagger-presto` CI check fails when enabling a new sub-environment | A service's env var file in the new sub-env directory is missing keys that exist in other sub-envs | See §4 below |
 | Messages accumulate in an SFTP outbound queue but are never consumed | `sftp-data-sync` stalled after encountering a malformed message | See §5 below |
+| `AADSTS70025: no configured federated identity credentials` on a client service (e.g. `int-icsf-node`) | FIC never created or was deleted from the service UAMI; UAMI exists but trust binding to AKS is missing | See §6 below |
 
 ---
 
@@ -1265,3 +1359,107 @@ containing an array of integers rather than a JSON string):
 > channel-close bug that prevented recovery were both fixed in
 > September 2024. If byte-encoded messages reappear, investigate the
 > publishing service before resorting to the manual workaround above.
+
+---
+
+### 6. AADSTS70025: client service has no configured federated identity credentials
+
+**Error pattern:**
+
+```
+invalid_client: AADSTS70025: The client '<uuid>'(<env>-<subenv>-<service>)
+has no configured federated identity credentials.
+```
+
+This error is emitted by Azure AD when a pod tries to exchange its
+Kubernetes ServiceAccount token for an Azure access token (Workload
+Identity flow) but the target UAMI has zero FICs configured. The
+UAMI itself exists (Azure resolved the Client ID to a named identity),
+but the trust binding between AKS and Azure AD is missing.
+
+This is distinct from an issuer/subject mismatch — a mismatch produces
+a different error. AADSTS70025 means no FIC at all.
+
+**Typical cause:** `korioctl azure fic create` was never run for this
+UAMI/sub-environment combination, or the FIC was accidentally deleted.
+This commonly surfaces when a new sub-environment is activated or an
+integration is promoted to a new environment.
+
+#### Step 1 — Confirm the FIC is absent
+
+```bash
+az identity federated-credential list \
+  --identity-name <env>-<subenv>-<service> \
+  -g vozni-<env>-sftp-storage \
+  --output table
+```
+
+If the output is empty, the FIC is missing. Proceed to step 2.
+
+If a FIC row does exist, inspect its `issuer` and `subject` columns
+against the expected values (see step 2) and correct any mismatch with
+`az identity federated-credential update`.
+
+#### Step 2 — Gather the AKS OIDC issuer URL
+
+```bash
+az aks show \
+  -g vozni-<env>-rg \
+  --name vozni-<env>-aks \
+  --query "oidcIssuerProfile.issuerUrl" \
+  -otsv
+```
+
+#### Step 3 - Create the missing FIC
+
+```bash
+korioctl azure fic create \
+  -g vozni-<env>-sftp-storage \
+  --identity <env>-<subenv>-<service> \
+  --issuer "https://eastus.oic.prodaks.azure.com/<sub_id>/<oidc_url>/" \
+  --subject "system:serviceaccount:<subenv>:<env>-<subenv>-<service>" \
+  <env>-<subenv>-<service>
+```
+
+Subject format is `system:serviceaccount:{namespace}:{serviceaccount-name}`
+where the Kubernetes namespace is the **sub-environment name** (e.g.
+`preview`), not the combined `env-subenv` string.
+
+#### Step 4 - Verify the ServiceAccount annotation in the cluster
+
+Even with a valid FIC, the Workload Identity webhook only injects a
+projected token if the ServiceAccount is annotated with the correct
+Client ID. Confirm it matches the UAMI's Client ID (from
+`identities.yaml`):
+
+```bash
+kubectl get serviceaccount <env>-<subenv>-<service> \
+  -n <subenv> \
+  -o jsonpath='{.metadata.annotations}'
+# Expected: {"azure.workload.identity/client-id":"<client-uuid>"}
+```
+
+#### Step 5 - Verify the pod label
+
+The Workload Identity mutating webhook only patches pods that carry
+the label `azure.workload.identity/use: "true"`. Confirm it is present:
+
+```bash
+kubectl get pod -n <subenv> -l app=<service> \
+  -o jsonpath='{.items[0].metadata.labels}'
+```
+
+If the label is missing, the pod never receives a projected
+ServiceAccount token regardless of whether the FIC is correct.
+
+#### Step 6 -- Restart the pod
+
+After creating or correcting the FIC, the pod must be restarted to
+acquire a fresh projected token:
+
+```bash
+kubectl rollout restart deployment/<service> -n <subenv>
+```
+
+Then confirm the pod starts cleanly and the Azure authentication error
+no longer appears in the container logs.
