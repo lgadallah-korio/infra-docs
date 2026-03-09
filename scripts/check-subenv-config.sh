@@ -299,19 +299,35 @@ check_a7_stray_refs() {
 # Part B: Azure checks
 # ---------------------------------------------------------------------------
 
+# Returns the Key Vault name for the given env/subenv pair, mirroring the
+# naming logic in terraform-infra/env/azure_key_vault.tf:
+#   prod / prod3 / staging3  ->  "vozni-{env}-{subenv}"
+#   all other envs           ->  "{env}-{subenv}"
+# NOTE: staging is missing from the prod-like set in Terraform (known oversight).
+# This function intentionally reflects the current actual naming, not the desired one.
+kv_name() {
+    local env="$1" subenv="$2"
+    case "$env" in
+        prod|prod3|staging3) echo "vozni-${env}-${subenv}" ;;
+        *)                   echo "${env}-${subenv}" ;;
+    esac
+}
+
 # B1: Key Vault, SFTP managed disk, and SFTP public IP provisioned by Terraform.
 # All three should exist if the sub-env appears in terraform-infra locals.tf.
 check_b1_terraform() {
     echo "=== B1: Terraform-provisioned Azure resources ==="
 
+    local kv
+    kv=$(kv_name "$kenv" "$sbenv")
     local kv_state
     kv_state=$(az keyvault show \
-        --name "vozni-${kenv}-${sbenv}" \
+        --name "$kv" \
         --query "properties.provisioningState" -o tsv 2>/dev/null) || kv_state=""
     if [[ "$kv_state" == "Succeeded" ]]; then
-        echo "$PASS Key Vault vozni-${kenv}-${sbenv}: ${kv_state}"
+        echo "$PASS Key Vault ${kv}: ${kv_state}"
     else
-        echo "$FAIL Key Vault vozni-${kenv}-${sbenv} not found or not provisioned (got: '${kv_state}')"
+        echo "$FAIL Key Vault ${kv} not found or not provisioned (got: '${kv_state}')"
         echo "     Fix: add ${sbenv} to terraform-infra locals.tf and apply"
         overall_pass=false
     fi

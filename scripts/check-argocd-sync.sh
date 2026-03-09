@@ -248,7 +248,14 @@ check_runtime_externalsecrets() {
             echo "     ${es_name}"
             [[ -n "$msg" ]] && echo "       ${msg}"
         done <<< "$failed_list"
-        echo "     Fix: create missing Key Vault secret(s) in vozni-${kenv}-${sbenv}"
+        # Key Vault name mirrors terraform-infra/env/azure_key_vault.tf:
+        # prod/prod3/staging3 use the "vozni-{env}-{subenv}" prefix; all others use "{env}-{subenv}".
+        local kv_hint
+        case "$kenv" in
+            prod|prod3|staging3) kv_hint="vozni-${kenv}-${sbenv}" ;;
+            *)                   kv_hint="${kenv}-${sbenv}" ;;
+        esac
+        echo "     Fix: create missing Key Vault secret(s) in ${kv_hint}"
         echo "     See argocd-sync-failures.md Phase 2"
         overall_pass=false
     fi
