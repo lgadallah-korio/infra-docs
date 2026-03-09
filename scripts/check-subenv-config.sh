@@ -303,8 +303,8 @@ check_a7_stray_refs() {
 # naming logic in terraform-infra/env/azure_key_vault.tf:
 #   prod / prod3 / staging3  ->  "vozni-{env}-{subenv}"
 #   all other envs           ->  "{env}-{subenv}"
-# NOTE: staging is missing from the prod-like set in Terraform (known oversight).
-# This function intentionally reflects the current actual naming, not the desired one.
+# NOTE: staging is missing from the prod-like set in Terraform and should
+# eventually be moved there (known oversight in azure_key_vault.tf).
 kv_name() {
     local env="$1" subenv="$2"
     case "$env" in
