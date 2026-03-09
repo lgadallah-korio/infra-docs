@@ -253,7 +253,7 @@ check_runtime_externalsecrets() {
         local kv_hint
         case "$kenv" in
             prod|prod3|staging3) kv_hint="vozni-${kenv}-${sbenv}" ;;
-            *)                   kv_hint="vozni-${kenv}" ;;
+            *)                   kv_hint="${kenv}-${sbenv}" ;;
         esac
         echo "     Fix: create missing Key Vault secret(s) in ${kv_hint}"
         echo "     See argocd-sync-failures.md Phase 2"

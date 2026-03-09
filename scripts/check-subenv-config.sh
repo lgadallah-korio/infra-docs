@@ -309,7 +309,7 @@ kv_name() {
     local env="$1" subenv="$2"
     case "$env" in
         prod|prod3|staging3) echo "vozni-${env}-${subenv}" ;;
-        *)                   echo "vozni-${env}" ;;
+        *)                   echo "${env}-${subenv}" ;;
     esac
 }
 
