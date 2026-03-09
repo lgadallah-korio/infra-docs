@@ -80,7 +80,7 @@ parse_args() {
     kenv="${positional[0]}"
     sbenv="${positional[1]}"
     svc="${positional[2]}"
-    [[ -z "$kubectl_context" ]] && kubectl_context="$kenv"
+    [[ -z "$kubectl_context" ]] && kubectl_context="vozni-${kenv}-aks"
     app_name="${svc}-${sbenv}"
     appset_file="${repos_root}/argocd/apps/${kenv}/${svc}-appset.yaml"
 }

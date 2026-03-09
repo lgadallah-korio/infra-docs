@@ -84,7 +84,7 @@ parse_args() {
     [[ ${#positional[@]} -lt 2 ]] && usage
     kenv="${positional[0]}"
     sbenv="${positional[1]}"
-    [[ -z "$kubectl_context" ]] && kubectl_context="$kenv"
+    [[ -z "$kubectl_context" ]] && kubectl_context="vozni-${kenv}-aks"
     sftp_rg="vozni-${kenv}-sftp-storage"
     storage_account="${kenv}sftpmirror"
 }
