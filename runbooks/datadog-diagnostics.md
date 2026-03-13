@@ -307,6 +307,83 @@ its role assignments under the subscription.
 
 ---
 
+## RabbitMQ integration
+
+RabbitMQ exposes Prometheus metrics on port 9419 (older Bitnami chart,
+`bitnamilegacy/rabbitmq` image) or port 15692 (current Bitnami chart).
+Korio's staging/prod/prod3 deployments use the older chart with port 9419.
+
+### Annotation format: v1 vs v2 precedence
+
+The Datadog agent supports two autodiscovery annotation formats:
+
+- **v1** (`check_names` / `init_configs` / `instances`) — legacy format;
+  the curated metric list is in `instances`.
+- **v2** (`checks`) — newer format; takes **precedence over v1** when both
+  are present on the same pod.
+
+If a pod has both formats, the agent uses v2 only. A stale v2 `checks`
+annotation with `"metrics": [".*"]` will scrape every available metric and
+hit the 2000-metric-per-check limit, causing a WARNING and incomplete data.
+
+### Detecting a stale `checks` annotation
+
+Check the StatefulSet pod template (not the live pods — the template is
+what persists through restarts):
+
+```bash
+# Check all staging sub-environments at once:
+for ns in accept configure my preview validate; do
+  echo "=== rabbitmq-${ns} ==="
+  kubectl get statefulset rabbitmq -n "rabbitmq-${ns}" \
+    -o jsonpath='{.spec.template.metadata.annotations}' | jq 'keys'
+done
+```
+
+If `ad.datadoghq.com/rabbitmq.checks` appears in the keys, the stale
+annotation is present and must be patched out.
+
+### Why `kubectl rollout restart` does not fix it
+
+A rollout restart recreates pods from the current pod template. If the
+template itself contains the stale annotation, restarted pods inherit it.
+The template must be patched directly.
+
+### Patching the StatefulSet template
+
+```bash
+# Remove the stale checks annotation from the pod template:
+for ns in accept configure my preview validate; do
+  kubectl patch statefulset rabbitmq -n "rabbitmq-${ns}" \
+    --type json \
+    -p '[{"op":"remove","path":"/spec/template/metadata/annotations/ad.datadoghq.com~1rabbitmq.checks"}]'
+done
+
+# Restart to apply the clean template to running pods:
+for ns in accept configure my preview validate; do
+  kubectl rollout restart statefulset/rabbitmq -n "rabbitmq-${ns}"
+done
+```
+
+For prod and prod3, add `--context vozni-prod-aks` or
+`--context vozni-prod3-aks`. Note: `rabbitmq-my` is the live
+production sub-environment — treat it with extra care and patch it
+in a separate maintenance window.
+
+### Why ArgoCD does not auto-heal this
+
+The ArgoCD ApplicationSets for RabbitMQ use `selfHeal: false` — ArgoCD
+will not reconcile live state drift back to desired state automatically.
+A forced sync is needed for ArgoCD to re-apply the Helm chart with the
+current values (which do not contain the `checks` annotation).
+
+However, if ArgoCD sync is failing (e.g. due to the Bitnami HTTP repo
+deprecation — see the ArgoCD sync failures runbook), a forced sync will
+also fail. In that case, patch the StatefulSet templates directly as
+above, and address the sync root cause separately.
+
+---
+
 ## Quick reference: useful commands
 
 ```bash

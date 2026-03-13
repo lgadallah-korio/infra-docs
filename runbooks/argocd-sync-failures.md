@@ -108,6 +108,36 @@ when the image reference simply needs to be corrected.
 
 ---
 
+**Failure mode 5 — Deprecated Helm chart repository (Bitnami HTTP → OCI)**
+
+Bitnami deprecated their HTTP Helm chart repository
+(`https://charts.bitnami.com/bitnami`) and migrated to OCI
+(`oci://registry-1.docker.io/bitnamicharts`). After the deprecation,
+Bitnami modified the HTTP repo's `index.yaml` in a way that ArgoCD's
+repo-server rejects, producing:
+
+```
+ComparisonError: Failed to load target state: failed to generate manifest
+for source 1 of 1: rpc error: code = Unknown desc = invalid revision
+'HEAD': improper constraint: HEAD
+```
+
+ArgoCD uses a stricter Helm index parser than the `helm` CLI — the same
+chart version may pull successfully with `helm pull` while ArgoCD fails.
+The apps show `Healthy / Synced` (reflecting the last successful sync)
+alongside a sync error, which can make them appear healthy when they are
+actually not being updated.
+
+Affected ApplicationSets in this repo: all `rabbitmq-appset.yaml` and
+`api-gateway-appset.yaml` / `internal-api-gateway-appset.yaml` files
+(fixed in argocd PR #886, 2026-03-13).
+
+Fix: change `repoURL` from `https://charts.bitnami.com/bitnami` to
+`oci://registry-1.docker.io/bitnamicharts` in the ApplicationSet.
+`chart:` and `targetRevision:` fields are unchanged.
+
+---
+
 ## Phase 0: Pre-check — verify the sub-environment is activated
 
 Before diagnosing individual application failures, confirm that the
@@ -600,9 +630,13 @@ Key fields to compare:
 ArgoCD Application not Synced/Healthy
             │
             ├─ sync.status = Unknown / SyncFailed
-            │    └─ Helm rendering error (Phase 3)
-            │         Check: targetRevision points to feature branch?
-            │         Fix:  merge branch -> release/MP-1 or pin to stable ref
+            │    ├─ Helm rendering error (Phase 3)
+            │    │    Check: targetRevision points to feature branch?
+            │    │    Fix:  merge branch -> release/MP-1 or pin to stable ref
+            │    │
+            │    └─ "invalid revision 'HEAD': improper constraint: HEAD"
+            │         Check: repoURL is https://charts.bitnami.com/bitnami?
+            │         Fix:  change repoURL to oci://registry-1.docker.io/bitnamicharts
             │
             ├─ sync.status = Synced, health.status = Progressing
             │    └─ Cluster resource exhaustion (Phase 4)
@@ -666,3 +700,11 @@ No repo changes required.
 | `argocd` or `presto-besto-manifesto` | Image tag reference | Correct the tag and open a PR |
 
 No Azure resource changes required.
+
+### Failure mode 5 — Deprecated Bitnami HTTP Helm repository
+
+| System | Resource | Action |
+|---|---|---|
+| `argocd` | `repoURL` in affected ApplicationSet | Change to `oci://registry-1.docker.io/bitnamicharts` and open a PR |
+
+No Azure resource changes required. `chart:` and `targetRevision:` fields are unchanged.
