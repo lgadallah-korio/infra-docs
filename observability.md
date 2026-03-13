@@ -294,11 +294,11 @@ terraform-infra/
 # Check Datadog pods
 kubectl get pods -n datadog
 
-# Node Agent logs
-kubectl logs -n datadog -l app=datadog
+# Node Agent logs (Operator v2 label scheme)
+kubectl logs -n datadog -l agent.datadoghq.com/component=agent
 
 # Cluster Agent logs
-kubectl logs -n datadog -l app=datadog-cluster-agent
+kubectl logs -n datadog -l agent.datadoghq.com/component=cluster-agent
 
 # Verify metrics are flowing (look for your cluster under Infrastructure → Containers in Datadog UI)
 # Tags to check: env:<environment>, cluster_name:<cluster>
