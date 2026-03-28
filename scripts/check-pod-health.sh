@@ -206,14 +206,14 @@ check_externalsecrets() {
     while IFS= read -r line; do
         local es_name es_status
         es_name=$(echo "$line" | awk '{print $1}')
-        # Columns (no-headers): NAME STORE REFRESH_INTERVAL STATUS READY
+        # Columns (no-headers): NAME STORE REFRESH INTERVAL STATUS READY
         # "REFRESH INTERVAL" is two words, so STATUS is $4, READY is $5.
         # Checking STATUS directly avoids the off-by-one ambiguity.
         es_status=$(echo "$line" | awk '{print $4}')
         [[ "$es_status" == "SecretSynced" ]] && continue
 
         found_failure=true
-        local desc missing_key attempt_info
+        local desc missing_key attempt_info error_type app_id
         desc=$(kubectl describe externalsecret "$es_name" \
             -n "$ns" --context "$kubectl_context" 2>/dev/null)
         missing_key=$(echo "$desc" \
@@ -223,12 +223,39 @@ check_externalsecrets() {
             | grep 'UpdateFailed' | tail -1 \
             | grep -oE 'x[0-9]+ over [0-9a-z]+' || true)
 
+        # Classify the root cause so the output is actionable.
+        if echo "$desc" | grep -q 'AADSTS7000222'; then
+            error_type="expired-credentials"
+            app_id=$(echo "$desc" | grep -oE "app '[a-f0-9-]+'" \
+                | head -1 | sed "s/app '//; s/'//")
+        elif echo "$desc" | grep -q 'StatusCode=401'; then
+            error_type="auth-failure"
+            app_id=""
+        elif [[ -n "${missing_key:-}" ]]; then
+            error_type="missing-key"
+            app_id=""
+        else
+            error_type=""
+            app_id=""
+        fi
+
         printf "  %s  externalsecret/%-40s  SecretSyncedError" \
             "$FAIL" "$es_name"
         [[ -n "${attempt_info:-}" ]] && printf "  (%s)" "$attempt_info"
         printf "\n"
-        [[ -n "${missing_key:-}" ]] \
-            && printf "         Missing key: %s\n" "$missing_key"
+        case "$error_type" in
+            expired-credentials)
+                printf "         Cause: expired service principal credentials"
+                [[ -n "${app_id:-}" ]] && printf "  (app: %s)" "$app_id"
+                printf "\n"
+                ;;
+            auth-failure)
+                printf "         Cause: authentication failure (401)\n"
+                ;;
+            missing-key)
+                printf "         Missing key: %s\n" "$missing_key"
+                ;;
+        esac
     done <<< "$raw"
 
     $found_failure || printf "  %s  all ExternalSecrets synced\n" "$PASS"

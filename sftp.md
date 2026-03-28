@@ -766,6 +766,93 @@ created child paths). The `-l` flags set the **LeafACL** (ACL on the
 directory being created, where `sftp-data-sync` reads and writes).
 Both must always be specified explicitly.
 
+#### Inspect Entra AD Group Membership
+
+The `sftp-read-{env}` and `sftp-read-write-{env}` groups are baked into
+every DLDP leaf ACL, so adding a human to one of these groups propagates
+access to all SFTP mirror directories automatically.
+
+List all members of both groups:
+
+```bash
+for group in "sftp-read-${kenv}" "sftp-read-write-${kenv}"; do
+  echo "=== ${group} ==="
+  az ad group member list \
+    --group "${group}" \
+    --query "[].{Name:displayName, UPN:userPrincipalName}" \
+    --output table
+done
+```
+
+Check whether a specific user is a member:
+
+```bash
+az ad group member check \
+  --group "sftp-read-${kenv}" \
+  --member-id "$(az ad user show --id user@domain.com --query id -otsv)"
+```
+
+Returns `{"value": true}` or `{"value": false}`.
+
+Add a user to a group:
+
+```bash
+az ad group member add \
+  --group "sftp-read-${kenv}" \
+  --member-id "$(az ad user show --id user@domain.com --query id -otsv)"
+```
+
+Use `sftp-read-write-${kenv}` instead for read-write access.
+
+Remove a user from a group:
+
+```bash
+az ad group member remove \
+  --group "sftp-read-${kenv}" \
+  --member-id "$(az ad user show --id user@domain.com --query id -otsv)"
+```
+
+Use `sftp-read-write-${kenv}` instead if the user is in the read-write group.
+
+#### Access control model: grants only, no deny
+
+ADLS2 POSIX ACLs are **purely additive** — there are no explicit deny
+entries. This has two practical implications:
+
+**Traversal vs. read access are separate.** To reach a file at
+`prod/my/sponsor/integration/subdir/file.txt`, ADLS2 requires execute
+(`x`) on every intermediate directory in the path. The ParentACL
+(`-p other::--x`) gives execute-only (traversal, no listing) to all
+authenticated principals on intermediate directories. Actual read or
+write access is only possible at directories that have an explicit ACL
+entry for the principal — so group members can traverse the hierarchy
+but cannot list or read anything they have not been explicitly granted.
+
+**Restricting access is by omission, not by denial.** Because there are
+no deny entries, you cannot grant broad root access and then carve out
+exceptions. The correct approach is to simply not include the group in
+the leaf ACL for paths that should be restricted. For the `my`
+sub-environment in particular — the final step in the client validation
+lifecycle — exclude `sftp-read-{env}` and `sftp-read-write-{env}` from
+the `-l` flags at DLDP creation time rather than attempting to remove
+access afterwards.
+
+If you do need to revoke group access from an existing DLDP path, set
+the permission bits to `---` for that group entry:
+
+```bash
+az storage fs access update-recursive \
+  --acl "group:<sftp_ro_id>:---" \
+  --path "${kenv}/${sbenv}/${sponsor}/${integration}" \
+  --file-system mirror \
+  --account-name "${kenv}sftpmirror" \
+  --auth-mode login
+```
+
+This is the closest ADLS2 offers to a deny: an explicit grant of no
+permissions. It does not override other grants the principal may hold
+via a different group membership or direct user entry.
+
 #### Update Presto Identity Config
 
 After UAMIs exist, register the **Client ID** (not Principal ID) in
