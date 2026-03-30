@@ -4,14 +4,18 @@
 # Validates the Azure identity chain for an SFTP client service integration.
 #
 # Usage:
-#   validate-sftp-identity.sh <serviceAccount> <workloadId> [<sponsor> <integration>]
+#   validate-sftp-identity.sh <env> <subenv> <service> [<sponsor> <integration>]
 #
 # Arguments:
-#   serviceAccount   serviceAccount value from identities.yaml
-#                    e.g. staging-preview-moderna-icsf-consumer
-#   workloadId       workloadId (UAMI Client ID) from identities.yaml
-#   sponsor          Optional: sponsor slug, e.g. moderna
-#   integration      Optional: integration slug, e.g. biostats
+#   env          Environment, e.g. staging
+#   subenv       Sub-environment, e.g. preview
+#   service      Service name as keyed in identities.yaml, e.g. int-icsf-node
+#   sponsor      Optional: sponsor slug, e.g. moderna
+#   integration  Optional: integration slug, e.g. biostats
+#
+# serviceAccount and workloadId are fetched directly from identities.yaml in
+# the presto-besto-manifesto GitHub repo (korio-clinical/presto-besto-manifesto):
+#   {env}/presto_conf/.internal/{subenv}/identities.yaml
 #
 # If sponsor/integration are provided, check 4 lists all directories under
 # {env}/{subenv}/{sponsor}/{integration} recursively, identifies the leaf
@@ -19,7 +23,7 @@
 # POSIX ACL on each one. If omitted, check 4 lists directories under
 # {env}/{subenv} so you can identify the correct sponsor and integration.
 #
-# Dependencies: az, jq
+# Dependencies: az, gh, jq
 
 set -uo pipefail
 
@@ -48,49 +52,72 @@ overall_pass=true
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <serviceAccount> <workloadId> [<sponsor> <integration>]
+Usage: $(basename "$0") <env> <subenv> <service> [<sponsor> <integration>]
 
-  serviceAccount   The service account name as recorded in identities.yaml,
-                   e.g. staging-preview-moderna-icsf-consumer.
-                   Used to look up the UAMI and derive env/subenv/resource group.
+  env          Environment, e.g. staging
+  subenv       Sub-environment, e.g. preview
+  service      Service name as keyed in identities.yaml,
+               e.g. int-icsf-node, moderna-icsf-consumer
+               serviceAccount and workloadId are fetched from:
+                 presto-besto-manifesto/{env}/presto_conf/.internal/{subenv}/identities.yaml
 
-  workloadId       The workloadId value from identities.yaml for this service account
-                   (a UUID). Check 1 verifies this matches the actual UAMI Client ID
-                   in Azure -- a mismatch means identities.yaml is out of sync.
-                   identities.yaml is at:
-                     presto-besto-manifesto/{env}/presto_conf/.internal/{subenv}/identities.yaml
-
-  sponsor          Optional: e.g. moderna
-  integration      Optional: e.g. biostats
-                   When provided, check 4 validates POSIX ACLs on all leaf directories
-                   under {env}/{subenv}/{sponsor}/{integration} in the mirror storage.
+  sponsor      Optional: e.g. moderna
+  integration  Optional: e.g. biostats
+               When provided, check 4 validates POSIX ACLs on all leaf directories
+               under {env}/{subenv}/{sponsor}/{integration} in the mirror storage.
 EOF
     exit 1
 }
 
 parse_args() {
-    [[ $# -lt 2 ]] && usage
+    [[ $# -lt 3 ]] && usage
 
-    service_account="$1"
-    workload_id="$2"
-    sponsor="${3:-}"
-    integration="${4:-}"
+    kenv="$1"
+    sbenv="$2"
+    local service="$3"
+    sponsor="${4:-}"
+    integration="${5:-}"
 
-    # Derive env and subenv from service_account ({env}-{subenv}-{service-name})
-    IFS='-' read -ra _parts <<< "$service_account"
-    kenv="${_parts[0]}"
-    sbenv="${_parts[1]}"
     sftp_rg="vozni-${kenv}-sftp-storage"
     storage_account="${kenv}sftpmirror"
+
+    # Fetch identities.yaml directly from GitHub. Requires 'gh' to be authenticated.
+    local identities_path="${kenv}/presto_conf/.internal/${sbenv}/identities.yaml"
+    local yaml_content
+    yaml_content=$(gh api \
+        "repos/korio-clinical/presto-besto-manifesto/contents/${identities_path}" \
+        -H "Accept: application/vnd.github.raw+json" \
+        2>/dev/null) || yaml_content=""
+
+    if [[ -z "$yaml_content" ]]; then
+        echo "Error: could not fetch ${identities_path} from presto-besto-manifesto" >&2
+        echo "  Ensure 'gh' is authenticated: gh auth status" >&2
+        exit 1
+    fi
+
+    # Extract serviceAccount and workloadId for the named service. Each service block
+    # is indented two spaces under identityConfig:; its fields are indented four spaces.
+    # The awk pattern exits the block when the next two-space-indented key is reached.
+    service_account=$(echo "$yaml_content" | \
+        awk -v svc="  ${service}:" \
+            '$0==svc{found=1;next} found&&/^  [^ ]/{exit} found&&/serviceAccount:/{print $2;exit}')
+    workload_id=$(echo "$yaml_content" | \
+        awk -v svc="  ${service}:" \
+            '$0==svc{found=1;next} found&&/^  [^ ]/{exit} found&&/workloadId:/{print $2;exit}')
+
+    if [[ -z "$service_account" || -z "$workload_id" ]]; then
+        echo "Error: service '${service}' not found in ${identities_path}" >&2
+        exit 1
+    fi
 }
 
 print_header() {
     echo ""
     echo "SFTP identity chain validation"
-    echo "  serviceAccount:  ${service_account}"
-    echo "  workloadId:      ${workload_id}"
     echo "  env:             ${kenv}"
     echo "  subenv:          ${sbenv}"
+    echo "  serviceAccount:  ${service_account}"
+    echo "  workloadId:      ${workload_id}"
     echo "  resource group:  ${sftp_rg}"
     echo "  storage account: ${storage_account}"
     if [[ -n "$sponsor" && -n "$integration" ]]; then
