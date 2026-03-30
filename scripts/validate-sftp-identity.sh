@@ -50,10 +50,20 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <serviceAccount> <workloadId> [<sponsor> <integration>]
 
-  serviceAccount   e.g. staging-preview-moderna-icsf-consumer
-  workloadId       UAMI Client ID, e.g. 2dd246c8-689b-4dee-a7b3-e63ec3a855d6
+  serviceAccount   The service account name as recorded in identities.yaml,
+                   e.g. staging-preview-moderna-icsf-consumer.
+                   Used to look up the UAMI and derive env/subenv/resource group.
+
+  workloadId       The workloadId value from identities.yaml for this service account
+                   (a UUID). Check 1 verifies this matches the actual UAMI Client ID
+                   in Azure -- a mismatch means identities.yaml is out of sync.
+                   identities.yaml is at:
+                     presto-besto-manifesto/{env}/presto_conf/.internal/{subenv}/identities.yaml
+
   sponsor          Optional: e.g. moderna
   integration      Optional: e.g. biostats
+                   When provided, check 4 validates POSIX ACLs on all leaf directories
+                   under {env}/{subenv}/{sponsor}/{integration} in the mirror storage.
 EOF
     exit 1
 }
@@ -122,9 +132,12 @@ check_uami() {
 }
 
 # Check 2: A FIC exists on the UAMI whose subject matches the expected
-# Kubernetes ServiceAccount in the correct namespace.
+# Kubernetes ServiceAccount in the correct namespace, and whose issuer matches
+# the AKS cluster's OIDC issuer URL. A subject mismatch causes AADSTS70025; an
+# issuer mismatch (e.g. prodaks vs prod-aks in the hostname) also causes
+# AADSTS70025 and is not caught by checking the subject alone.
 check_fic() {
-    echo "=== Check 2: FIC exists with correct subject ==="
+    echo "=== Check 2: FIC exists with correct subject and issuer ==="
 
     local expected_subject="system:serviceaccount:${sbenv}:${service_account}"
     local fic_list
@@ -139,25 +152,55 @@ check_fic() {
     if [[ "$fic_count" -eq 0 ]]; then
         echo "$FAIL No FICs configured -- pod will fail with AADSTS70025"
         overall_pass=false
-    else
-        echo "$PASS $fic_count FIC(s) found"
-        local matching
-        matching=$(echo "$fic_list" | \
-            jq -r --arg s "$expected_subject" '[.[] | select(.subject == $s)] | length')
-        if [[ "$matching" -gt 0 ]]; then
-            local issuer
-            issuer=$(echo "$fic_list" | \
-                jq -r --arg s "$expected_subject" '.[] | select(.subject == $s) | .issuer')
-            echo "$PASS Subject matches: $expected_subject"
-            echo "$INFO Issuer: $issuer"
+        echo ""
+        return
+    fi
+
+    echo "$PASS $fic_count FIC(s) found"
+
+    local matching
+    matching=$(echo "$fic_list" | \
+        jq -r --arg s "$expected_subject" '[.[] | select(.subject == $s)] | length')
+
+    if [[ "$matching" -gt 0 ]]; then
+        local actual_issuer
+        actual_issuer=$(echo "$fic_list" | \
+            jq -r --arg s "$expected_subject" '.[] | select(.subject == $s) | .issuer')
+        echo "$PASS Subject matches: $expected_subject"
+
+        # Validate the issuer against the AKS cluster's OIDC issuer URL.
+        # A FIC created with a malformed issuer (e.g. prodaks.azure.com instead of
+        # prod-aks.azure.com) is accepted by Azure but fails at token exchange time.
+        local expected_issuer
+        expected_issuer=$(az aks show \
+            -g "vozni-${kenv}-rg" \
+            --name "vozni-${kenv}-aks" \
+            --query "oidcIssuerProfile.issuerUrl" \
+            -otsv 2>/dev/null) || expected_issuer=""
+
+        if [[ -z "$expected_issuer" ]]; then
+            echo "$INFO Issuer: $actual_issuer"
+            echo "$INFO Could not retrieve AKS OIDC issuer URL -- skipping issuer check"
         else
-            echo "$FAIL No FIC with expected subject: $expected_subject"
-            echo "$INFO Actual subject(s):"
-            echo "$fic_list" | jq -r '.[].subject' | while read -r s; do
-                echo "     $s"
-            done
-            overall_pass=false
+            # Normalize trailing slash before comparing
+            local norm_actual="${actual_issuer%/}"
+            local norm_expected="${expected_issuer%/}"
+            if [[ "$norm_actual" == "$norm_expected" ]]; then
+                echo "$PASS Issuer matches AKS OIDC URL: $actual_issuer"
+            else
+                echo "$FAIL Issuer mismatch -- pod will fail with AADSTS70025"
+                echo "     FIC issuer:   $actual_issuer"
+                echo "     AKS OIDC URL: $expected_issuer"
+                overall_pass=false
+            fi
         fi
+    else
+        echo "$FAIL No FIC with expected subject: $expected_subject"
+        echo "$INFO Actual subject(s):"
+        echo "$fic_list" | jq -r '.[].subject' | while read -r s; do
+            echo "     $s"
+        done
+        overall_pass=false
     fi
     echo ""
 }

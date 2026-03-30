@@ -708,7 +708,7 @@ for sbenv in configure validate preview; do
   korioctl azure fic create \
     -g "${sftp_rg}" \
     --identity "${kenv}-${sbenv}-${study}" \
-    --issuer "https://eastus.oic.prodaks.azure.com/${sub_id}/${oidc_url}/" \
+    --issuer "https://eastus.oic.prod-aks.azure.com/${sub_id}/${oidc_url}/" \
     --subject "system:serviceaccount:${sbenv}:${kenv}-${sbenv}-${study}" \
     "${kenv}-${sbenv}-${study}"
 done
@@ -1324,13 +1324,17 @@ az storage fs access show \
   --account-name {env}sftpmirror \
   --file-system mirror \
   --path "{env}/{subenv}/{sponsor}/{integration}" \
-  --auth-mode login
+  --auth-mode login \
+  --query acl -o tsv \
+  | tr ',' '\n'
 ```
 
-The `acl` field in the output uses the format
-`user::rwx,group::rwx,other::---` plus named entries like
-`user:<uid>:rwx` and `group:<gid>:rwx`. Cross-reference the GIDs in
-named entries against `generators/etc-group` to resolve group names.
+The output lists one ACL entry per line in the format
+`user::rwx`, `group::rwx`, `other::---`, plus named entries like
+`user:<principal-id>:rwx` and `group:<group-id>:rwx`. Cross-reference
+the GIDs in named entries against `generators/etc-group` to resolve
+group names. Named entries prefixed with `default:` are the inherited
+ParentACL applied to newly created child paths.
 
 **Check Azure RBAC role assignments for a user on the storage account:**
 
@@ -1503,7 +1507,7 @@ az aks show \
 korioctl azure fic create \
   -g vozni-<env>-sftp-storage \
   --identity <env>-<subenv>-<service> \
-  --issuer "https://eastus.oic.prodaks.azure.com/<sub_id>/<oidc_url>/" \
+  --issuer "https://eastus.oic.prod-aks.azure.com/<sub_id>/<oidc_url>/" \
   --subject "system:serviceaccount:<subenv>:<env>-<subenv>-<service>" \
   <env>-<subenv>-<service>
 ```
