@@ -1,31 +1,22 @@
 # IdP Migration
 
-This document describes the existing identity and authentication
-system built around Azure Entra B2C and defines requirements for
-its replacement.
+This document describes the existing identity and authentication system built around Azure Entra B2C and defines requirements for its replacement.
 
 ## Current System
 
 ### Overview
 
 Authentication for Korio's application users is provided by
-**Azure Entra B2C**, one tenant per environment. The two
-application components that integrate with B2C are:
+[**Azure Entra B2C**](https://learn.microsoft.com/en-us/azure/active-directory-b2c/technical-overview), one tenant per environment. The two application components that integrate with B2C are:
 
-- **`portico-react`** — the React SPA; handles login and token
-  acquisition via MSAL.
-- **`auth-node`** — a Node.js microservice; validates tokens on
-  every inbound API request and resolves the caller's identity.
+- [**`portico-react`**](https://github.com/korio-clinical/portico-react-llama) — the React SPA; handles login and token acquisition via [MSAL](https://learn.microsoft.com/en-us/entra/identity-platform/msal-overview).
+- [**`auth-node`**](https://github.com/korio-clinical/auth-node-llama) — a [Node.js](https://nodejs.org/en) microservice; validates tokens on every inbound API request and resolves the caller's identity.
 
-NGINX sits between the two as the API gateway, enforcing that every
-backend request passes through `auth-node` before being proxied.
+[NGINX](https://nginx.org/) sits between the two as the API gateway, enforcing that every backend request passes through `auth-node` before being proxied.
 
 ### B2C Tenants (Per Environment)
 
-One B2C tenant is provisioned per environment. All clients within
-an environment share the same tenant — there is no per-client B2C
-isolation. Client context (which service version/path a user
-belongs to) is resolved post-login by `back-end-node`, not by B2C.
+One B2C tenant is provisioned per environment. All clients within an environment share the same tenant — there is no per-client B2C isolation. Client context (which service version/path a user belongs to) is resolved post-login by [`back-end-node`](https://github.com/korio-clinical/back-end-node-llama), not by B2C.
 
 | Environment | Tenant Name | Policy Name |
 |---|---|---|
@@ -42,13 +33,13 @@ portico-react                NGINX               auth-node          MongoDB
      |-- login redirect ------>|                     |                 |
      |<-- redirect to B2C -----|                     |                 |
      |                                               |                 |
-     |======= B2C login / MFA (browser redirect) ========>            |
-     |<====== ID token (OIDC) ============================             |
+     |======= B2C login / MFA (browser redirect) ===>|                 |
+     |<====== ID token (OIDC) =======================|                 |
      |                                               |                 |
-     |-- GET /api/v1/... Bearer: {idToken} -------->|                 |
+     |-- GET /api/v1/... Bearer: {idToken} --------->|                 |
      |                         |-- auth_request ---->|                 |
-     |                         |      GET /api/v1/auth/verify         |
-     |                         |                     |-- JWKS verify  |
+     |                         |      GET /api/v1/auth/verify          |
+     |                         |                     |-- JWKS verify   |
      |                         |                     |-- lookup email->|
      |                         |                     |<- user record --|
      |                         |                     |-- assert ACTIVE |
@@ -57,14 +48,9 @@ portico-react                NGINX               auth-node          MongoDB
      |                         |   X_HTTP_USER: {...}                  |
 ```
 
-- `portico-react` acquires the **ID token** (not the access token)
-  and sends it as `Authorization: Bearer` on all API calls.
-- NGINX uses `auth_request` to call `auth-node` synchronously on
-  every request. On success, `auth-node` returns the resolved user
-  object in a response header (`X_HTTP_USER`), which NGINX
-  forwards to the backend service.
-- Token is stored in `SessionStorage`; cleared on tab close.
-  A 15-minute inactivity timeout is enforced client-side.
+- `portico-react` acquires the **ID token** (not the access token) and sends it as `Authorization: Bearer` on all API calls.
+- NGINX uses `auth_request` to call `auth-node` synchronously on every request. On success, `auth-node` returns the resolved user object in a response header (`X_HTTP_USER`), which NGINX forwards to the backend service.
+- The token is stored in `SessionStorage`; cleared on tab close. A 15-minute inactivity timeout is enforced client-side.
 
 ### Libraries
 
@@ -78,11 +64,7 @@ portico-react                NGINX               auth-node          MongoDB
 
 ### Token Validation (`auth-node`)
 
-`auth-node` uses `passport-azure-ad` BearerStrategy. The OIDC
-metadata URL is constructed from the environment's tenant name and
-policy name at startup. The strategy fetches the JWKS from B2C,
-validates the JWT signature, and asserts the audience matches
-`AZURE_CLIENT_ID`.
+`auth-node` uses [`passport-azure-ad`](https://www.npmjs.com/package/passport-azure-ad) BearerStrategy. The [OIDC](https://openid.net/developers/how-connect-works/) metadata URL is constructed from the environment's tenant name and policy name at startup. The strategy fetches the [JWKS](https://datatracker.ietf.org/doc/html/rfc7517) from B2C, validates the [JWT](https://datatracker.ietf.org/doc/html/rfc7519) signature, and asserts the audience matches `AZURE_CLIENT_ID`.
 
 Claims extracted from the validated token:
 
@@ -91,10 +73,7 @@ Claims extracted from the validated token:
 
 ### User Management (Graph API)
 
-Out-of-band user lifecycle operations (performed by Korio
-administrators, not end users) are implemented via the Microsoft
-Graph API using client credentials. The B2C object ID returned by
-Graph is stored on the MongoDB user record as `user.azure_oid`.
+Out-of-band user lifecycle operations (performed by Korio administrators, not end users) are implemented via the Microsoft Graph API using client credentials. The B2C object ID returned by Microsoft Graph is stored on the MongoDB user record as `user.azure_oid`.
 
 | Operation | Graph Endpoint |
 |---|---|
@@ -106,10 +85,7 @@ Graph is stored on the MongoDB user record as `user.azure_oid`.
 
 ### Test Environment Override
 
-When `NODE_ENV === 'SQAA'`, `auth-node` bypasses B2C validation
-entirely and validates tokens using a local symmetric key
-(`JWT_SECRET_KEY`). This path must be preserved or reproduced
-in the replacement.
+When `NODE_ENV === 'SQAA'`, `auth-node` bypasses B2C validation entirely and validates tokens using a local symmetric key (`JWT_SECRET_KEY`). This path must be preserved or reproduced in the replacement.
 
 ---
 
@@ -121,8 +97,8 @@ in the replacement.
 |---|---|
 | F-1 | **Headless / API-first.** No enforced hosted login UI from the IdP. Korio must be able to supply its own login UI or control the login UX entirely. |
 | F-2 | **OIDC / OAuth 2.0.** Must issue OIDC ID tokens consumable by a standard JWT library. Token must include an email claim usable as a user identifier. |
-| F-3 | **SAML 2.0.** Must support acting as a SAML service provider (SP) to federate with upstream corporate IdPs (e.g. a sponsor's Okta or Azure AD tenant). This is required to support sponsor SSO mandates such as those that may arise from clients like Bristol Myers Squibb. |
-| F-4 | **Multi-factor authentication.** Must support at minimum email OTP; TOTP (authenticator app) strongly preferred. |
+| F-3 | **SAML 2.0.** Must support acting as a [SAML](https://en.wikipedia.org/wiki/SAML) service provider (SP) to federate with upstream corporate IdPs (e.g. a sponsor's Okta or Azure AD tenant). This is required to support sponsor SSO mandates such as those that may arise from clients like Bristol Myers Squibb. |
+| F-4 | **Multi-factor authentication.** Must support at minimum e-mail OTP; [TOTP](https://en.wikipedia.org/wiki/Time-based_one-time_password) (authenticator app) strongly preferred. |
 | F-5 | **Out-of-band user management.** All user lifecycle operations (create, enable/disable, password reset, MFA enrollment) must be available via a management API callable by Korio's own services — no reliance on user-initiated self-service flows for these operations. |
 | F-6 | **Admin web console.** A web UI for Korio administrators to inspect and manage users, applications, and IdP configuration. |
 | F-7 | **Per-environment isolation.** Must support logically separate identity stores per deployment environment (dev / test / staging / prod), equivalent to the current one-tenant-per-environment model. |
@@ -157,7 +133,7 @@ in the replacement.
 |---|---|
 | M-1 | **Lazy user migration.** Users are migrated on-demand as they authenticate, not in a batch cutover. When a user presents a valid B2C token during the transition period, `auth-node` detects that the account has not yet been migrated, creates the account in the new IdP via the management API, and returns a redirect response that portico-react handles to move the user to the new IdP login. After the user completes their first new-IdP login and resets their password, the corresponding B2C account is disabled. See [Lazy Migration Flow](#lazy-migration-flow) below. |
 | M-2 | **Migration state tracking.** The MongoDB user record must carry a migration status field (e.g. `auth_migration_status: pending \| migrated`) so that `auth-node` can determine which token validation path to apply per user. |
-| M-3 | **Temporary credential delivery.** During lazy migration, a temporary password is generated by the new IdP management API (not by `auth-node`) and displayed to the user in-browser immediately after their B2C login. It must be: single-use (invalidated after first new-IdP login regardless of whether password reset has completed), short-lived (15-30 minute expiry), and generated by a CSPRNG. The credential is never stored by `auth-node` and is not transmitted via email. |
+| M-3 | **Temporary credential delivery.** During lazy migration, a temporary password is generated by the new IdP management API (not by `auth-node`) and displayed to the user in-browser immediately after their B2C login. It must be: single-use (invalidated after first new-IdP login regardless of whether password reset has completed), short-lived (15-30 minute expiry), and generated by a [CSPRNG](https://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator). The credential is never stored by `auth-node` and is not transmitted via email. |
 | M-4 | **Dual-token parallel operation.** During the transition period, `auth-node` must validate both B2C tokens (for unmigrated users) and new IdP tokens (for migrated users). The validation path is selected per request based on `auth_migration_status`. |
 | M-5 | **Unclaimed account cleanup.** A Kubernetes CronJob runs on an interval matching the temporary password expiry window (e.g. every 30 minutes). It queries MongoDB for users with `auth_migration_status: awaiting_login` whose new IdP account was created more than one expiry window ago, deletes those accounts from the new IdP, and resets `auth_migration_status` to `pending`. This returns the user to a clean migration-ready state for their next B2C login attempt. The CronJob must only target accounts older than the expiry window to avoid deleting accounts that are actively being claimed. |
 | M-5a | **Post-transition sweep.** After the transition window closes, any user accounts still at `auth_migration_status: pending` (users who never logged in during the transition period) must be handled: either batch-migrated with a forced password reset notification, or disabled, depending on policy. |
@@ -171,7 +147,7 @@ in the replacement.
 portico-react         NGINX          auth-node        new IdP mgmt API     B2C mgmt API
      |                  |                |                    |                   |
      |-- B2C login ----> (browser redirect to B2C)            |                   |
-     |<-- B2C ID token --------------------------------        |                   |
+     |<-- B2C ID token --------------------------------       |                   |
      |                  |                |                    |                   |
      |-- GET /api/... Bearer: {b2cToken}->|                   |                   |
      |                  |-- auth_request->|                   |                   |
@@ -208,10 +184,7 @@ Notes:
 
 ## Candidate Providers
 
-The following providers have been identified as candidates for qualification
-against the requirements above. Providers are grouped by deployment model.
-This list is not exhaustive and is intended as a starting point for the
-formal survey and qualification tasks.
+The following providers have been identified as candidates for qualification against the requirements above. Providers are grouped by deployment model. This list is not exhaustive and is intended as a starting point for the formal survey and qualification tasks.
 
 ### Shortlist
 
@@ -250,3 +223,4 @@ formal survey and qualification tasks.
 | Terraform / Azure | B2C tenant provisioning | Replace with new IdP provisioning (Terraform provider or manual) |
 | Environment config | B2C tenant/policy env vars | Add new IdP issuer/client env vars alongside B2C vars during transition; remove B2C vars post-transition |
 | New: migration CronJob | — | Kubernetes CronJob to detect and clean up unclaimed new-IdP accounts; resets `auth_migration_status` to `pending` so users get a fresh migration attempt on next B2C login |
+
