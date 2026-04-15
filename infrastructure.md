@@ -58,12 +58,16 @@ section for full technical details.
 **MongoDB Atlas** clusters hosted on Azure and connected to AKS via
 **Azure Private Link**. Atlas clusters, database users, and Private Link
 endpoints are managed by Terraform (`terraform-infra/env/atlas_clusters.tf`,
-`env/atlas_privatelink_azure.tf`, `env/azure_privatelink_atlas.tf`). One
-database user is created per sub-environment; its username equals the
-sub-environment name (e.g. `validate`). The MongoDB connection URI — including
-the Terraform-managed password — must be written to each sub-environment's
-Azure Key Vault manually after each Terraform apply. Terraform does not do
-this automatically. See [MongoDB Atlas Credential Management](#mongodb-atlas-credential-management).
+`env/atlas_privatelink_azure.tf`, `env/azure_privatelink_atlas.tf`). There
+are three distinct Atlas identity tiers: (1) **application users** — one per
+sub-environment, Terraform-managed, credential injected into every pod via
+ExternalSecret; (2) **human/developer users** — provisioned by
+`devops-scripts/atlas/provision-db-user/provision-db-user.sh`, secrets stored
+in the central `korio-credentials` Key Vault; (3) a **master admin** user per
+cluster, Terraform-managed, password in Terraform state only. The MongoDB
+connection URI for each sub-environment must be written to that sub-env's
+Key Vault manually after each Terraform apply — Terraform does not do this
+automatically. See [MongoDB Atlas Credential Management](#mongodb-atlas-credential-management).
 Do not create or modify Atlas database users whose name matches a sub-environment
 name outside of Terraform — they will be overwritten on the next apply.
 
@@ -73,6 +77,71 @@ public internet. Developer access is mediated by **Twingate**, which
 provides zero-trust network access to private subnets. A Twingate client
 must be running and connected to access any `*.internal` or
 cluster-internal endpoint.
+
+## korio.cloud DNS Architecture
+
+The `korio.cloud` domain is used exclusively for internal
+service-to-service communications within each AKS cluster. It is
+entirely separate from `korioclinical.com`, which carries user-facing
+traffic via Cloudflare.
+
+### DNS resolution chain
+
+DNS resolution inside AKS follows this path:
+
+```
+Pod
+  --> CoreDNS (in-cluster; handles cluster.local, then forwards)
+  --> Azure VNet DNS (168.63.129.16; built-in resolver for the AKS VNet)
+  --> Azure Private DNS zones (*.{env}.korio.cloud)
+```
+
+CoreDNS does not define stub zones for `korio.cloud` — it simply forwards
+non-cluster queries to the Azure VNet DNS resolver, which intercepts them
+and serves answers from the VNet-linked private DNS zones.
+
+### Private DNS zones
+
+One private DNS zone per environment (`{env}.korio.cloud`) is provisioned
+in the `devops-test` resource group and linked to the AKS VNet for that
+environment. These zones serve three purposes:
+
+1. **Node auto-registration** — the VNet link has `registrationEnabled:
+   true`, so AKS nodes register their private IP addresses automatically
+   when they join the cluster.
+2. **Wildcard internal routing** — a `*` A record (TTL 1) points to the
+   internal NGINX load balancer IP, routing all
+   `*.{env}.korio.cloud` hostnames to the in-cluster ingress controller.
+3. **Twingate access** — the Twingate connector container uses the VNet
+   DHCP-assigned DNS server (168.63.129.16), which resolves these private
+   zone records. This is what allows developers to reach
+   internal hostnames over the Twingate tunnel.
+
+### Public DNS zones
+
+Azure also contains **public** DNS zones for `{env}.korio.cloud` (one per
+environment, held in per-environment resource groups). These zones are not
+delegated from Cloudflare and are therefore unreachable from the public
+internet. They are orphaned artefacts — they predate the migration of
+`korio.cloud` to Cloudflare — and serve no active purpose.
+
+### Compliance gap
+
+Neither the private nor the public `korio.cloud` DNS zones are managed by
+Terraform. They were provisioned manually and sit in non-standard resource
+groups. This is a compliance gap: infrastructure that is not represented
+in IaC cannot be reviewed, audited, or safely modified via the standard
+change process.
+
+The remediation plan is:
+1. Import private DNS zones into `terraform-infra/env/` (no infrastructure
+   changes — state-only operation).
+2. Delete the orphaned public DNS zones via Terraform.
+3. Relocate private zones from `devops-test` to `vozni-{env}-rg`
+   (deferred: requires Twingate impact assessment).
+
+See the [korio.cloud DNS Remediation runbook](runbooks/korio-cloud-dns-remediation.md)
+for the step-by-step procedure.
 
 ## terraform-infra (Terraform/HCL)
 
@@ -402,6 +471,23 @@ the following are required across multiple repos:
 
 ## MongoDB Atlas Credential Management
 
+### Access identity taxonomy
+
+There are three distinct Atlas identity tiers, each with different ownership
+and lifecycle:
+
+| Tier | Who/what | Count | Managed by | Credentials stored |
+|---|---|---|---|---|
+| **Application (sub-env)** | One per sub-environment; used by every microservice in that sub-env | 5/cluster | Terraform | Terraform state; URI in sub-env Key Vault |
+| **Master admin** | Single `admin` user with `atlasAdmin` on each cluster | 1/cluster | Terraform | Terraform state only |
+| **Human/developer** | Named users for developer direct access (MongoDBCompass, Atlas UI) | Variable | Manual (`provision-db-user.sh`) | Per-user secret in central `korio-credentials` Key Vault |
+
+The application tier is the operationally significant one: it backs the
+`MONGO_CONNECTION_STRING` env var that every running microservice reads.
+The human tier is independent — human credentials are stored in a
+**separate central Key Vault** (`korio-credentials`), not in the per-sub-env
+vaults used by applications.
+
 ### Resource ownership
 
 Atlas infrastructure is split across Terraform-managed and manually-managed
@@ -413,9 +499,12 @@ resources:
 | Atlas clusters | Terraform | `env/atlas_clusters.tf` |
 | Private Link (Atlas side) | Terraform | `env/atlas_privatelink_azure.tf` |
 | Private Link (Azure side) | Terraform | `env/azure_privatelink_atlas.tf` |
-| Database users (one per sub-env) | Terraform | `env/atlas_clusters.tf` |
-| MongoDB URI in Key Vault | **Manual** | Not written by Terraform |
-| Atlas-level admin/integration users | Manual | Not in Terraform |
+| App database users (one per sub-env) | Terraform | `env/atlas_clusters.tf` |
+| Master admin user | Terraform | `env/atlas_clusters.tf` |
+| MongoDB URI in sub-env Key Vault | **Manual** | Not written by Terraform |
+| Human/developer Atlas users | Manual | `devops-scripts/atlas/provision-db-user/` |
+| Human user secrets in central Key Vault | Manual | `devops-scripts/atlas/provision-db-user/` |
+| Key Vault RBAC for human secrets | Manual | `devops-scripts/atlas/provision-db-user/` |
 
 ### Database user naming convention
 
@@ -488,6 +577,69 @@ in every pod that connects to MongoDB. Terraform prints no warning about this.
 
 3. **Temporary debug users are safe** as long as the username does not match a
    sub-environment name. Delete them from Atlas when done.
+
+### Human/developer user provisioning
+
+Human users (developers accessing Atlas directly via MongoDB Compass or the
+Atlas UI) are provisioned by the script at
+`devops-scripts/atlas/provision-db-user/provision-db-user.sh`. It performs
+the full workflow in one pass:
+
+1. Creates a database user in the Atlas project for the target environment
+2. Resolves all cluster Private Link hostnames in that project
+3. Constructs a `mongodb+srv://` connection URI per cluster
+4. Writes each URI as a Key Vault secret to the central `korio-credentials`
+   vault (subscription `a26c9760-e77e-4149-97b4-6c33453b3dbd`, RG
+   `vozni-common-rg`), using the naming convention:
+   `{username}-{cluster-name}-db-connection-string`
+5. Sets an Azure RBAC role assignment so only the named user's Entra identity
+   can read their own secrets
+
+Roles granted vary by environment:
+- Lower environments (`dev`, `test`, `platform`): `readWriteAnyDatabase`
+- `prod`/`prod3`: custom read-only roles (`prod-admin-readonly-my`,
+  `prod3-admin-readonly-my`)
+
+The resulting secret count per human user scales with the number of clusters
+they require access to — up to 24 secrets for full cross-environment access.
+
+Existing provisioned users are tracked in
+`devops-scripts/atlas/populate-provisioned-users-catalog/`, which scans the
+`korio-credentials` vault and generates Terraform HCL catalog entries and
+Azure RBAC import blocks. The script explicitly excludes the sub-environment
+service account names (`configure`, `preview`, `validate`, `accept`, `my`,
+`admin`) from its output.
+
+### Application credential injection flow
+
+Application pods receive their MongoDB connection string via the following
+chain:
+
+```
+Terraform apply
+  --> creates/rotates random_password for sub-env Atlas user
+  --> stores password in Terraform state only
+         |
+    [manual step]
+         |
+         v
+Sub-env Key Vault  (vozni-{env}-{subenv})
+  secret name: MONGO-CONNECTION-STRING
+         |
+ExternalSecret  (refreshInterval: 30s)
+  --> syncs to K8s Secret  {appName}-kv  in namespace {subenv}
+         |
+Pod env var: MONGO_CONNECTION_STRING
+  --> all microservices in the sub-env share this single credential
+```
+
+Key points:
+- **All microservices in a sub-environment share one Atlas credential.** There
+  is no per-service or per-pod identity at the application tier.
+- The credential is static between Terraform applies. Rotation is manual and
+  requires both a Terraform apply and a Key Vault update (see below).
+- Additional MongoDB-related env vars (`MONGO_NAME_PREFIX`, `MONGO_HOST`,
+  `MONGO_MAX_POOL_SIZE`) are sourced from ConfigMaps, not Key Vault.
 
 ### Updating Key Vault after a Terraform apply
 

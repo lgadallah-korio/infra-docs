@@ -70,6 +70,11 @@ experiments).
 
 Detailed reference documentation is split by domain:
 
+- **[Theory of Operation](theory-of-operation.md)** — Conceptual
+  primer: the business constraint, path-based version isolation,
+  networking foundations, reverse proxy pattern, full request
+  lifecycle, toolchain overview. Start here if you are new to the
+  platform.
 - **[Application Stack](application-stack.md)** — NGINX routing
   and request flow, korioctl, dagger-presto, ArgoCD, Helm chart
   architecture, presto-besto-manifesto, Docker local dev, microservice
