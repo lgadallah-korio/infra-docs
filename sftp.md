@@ -172,6 +172,26 @@ int-biostats-node / int-nest-node  (authenticates to {env}sftpmirror as its own 
 output written to Data Lake or MongoDB
 ```
 
+### Principal types and access paths
+
+Three distinct classes of principal interact with the SFTP system via
+completely separate paths. Understanding this prevents misapplying the
+wrong provisioning steps to the wrong type of user.
+
+| Principal | How they authenticate | What they access | Never touches |
+|-----------|----------------------|-----------------|---------------|
+| **External SFTP user** (sponsor / client) | SSH key pair | Azure Disk PVC, via the OpenSSH daemon | ADLS2, Entra groups, UAMIs |
+| **Korio staff** (portal / CLI access to the mirror) | Entra AD account in `sftp-read-{env}` or `sftp-read-write-{env}` | ADLS2 mirror (`{env}sftpmirror`) | SFTP server PVC directly |
+| **Pod services** (e.g. `sftp-data-sync`, `int-biostats-node`) | Azure Workload Identity (UAMI + FIC) | ADLS2 mirror (`{env}sftpmirror`) | SSH |
+
+**External SFTP users have no Azure credentials and no path to ADLS2.**
+They connect via SSH, land in their chroot-jailed home directory on the
+Azure Disk PVC, and are subject only to POSIX ACLs on that disk. The
+`sftp-read-{env}` and `sftp-read-write-{env}` Entra groups and all
+UAMI/FIC/DLDP provisioning are irrelevant to external users. When adding
+a human external user, only the Kubernetes manifest steps apply: Unix
+user entry, group membership, SSH key, and home directory volume mount.
+
 Each Kubernetes-to-Azure boundary requires a UAMI + FIC pair per
 sub-environment. `sftp-server` and each client service (e.g.
 `int-biostats-node`) each have their own UAMI. The sftp-server UAMI is
@@ -1223,17 +1243,22 @@ sftp ${username}@sftp.korioclinical.com
 
 ### Two independent access control layers
 
-SFTP access problems almost always fall into one of two distinct layers.
-Conflating them wastes time — diagnose which layer is broken first.
+Access problems fall into three distinct layers depending on which
+principal type is affected. Conflating them wastes time — identify the
+principal type first, then diagnose the relevant layer.
 
-| Layer | What it controls | Where it lives |
-|-------|-----------------|----------------|
-| **POSIX ACLs** (ADLS2) | Which UIDs/GIDs can read/write specific paths inside the `mirror` container | Set by `sftp-acl-init` at pod startup; stored on the ADLS2 filesystem itself |
-| **Azure RBAC** | Whether a principal can reach the storage account at all — e.g. browse it in Azure Portal or call data-plane APIs with `--auth-mode login` | IAM role assignments on the storage account resource |
+| Layer | Affects | What it controls | Where it lives |
+|-------|---------|-----------------|----------------|
+| **POSIX ACLs (Azure Disk PVC)** | External SFTP users | Which UIDs/GIDs can read/write specific paths during an active SFTP session | Set by `sftp-acl-init` at pod startup; stored on the Azure Disk PVC |
+| **POSIX ACLs (ADLS2 mirror)** | Korio staff, pod services | Which UIDs/GIDs can read/write specific paths in the `mirror` container | Set by `korioctl azure dldp create`; stored on the ADLS2 filesystem |
+| **Azure RBAC** | Korio staff | Whether a principal can reach the storage account at all — e.g. browse it in Azure Portal or call data-plane APIs with `--auth-mode login` | IAM role assignments on the storage account resource |
 
-A user complaining they "can't see prod SFTP directories in Azure Portal"
-is experiencing an Azure RBAC gap, not an ACL gap. Conversely, a user
-who can connect via SFTP but is denied on a specific path has an ACL gap.
+An external SFTP user denied on a specific path has a PVC POSIX ACL gap
+— check `sftp-acl-init` patch args and group membership in `etc-group`.
+A Korio staff member who cannot see prod SFTP directories in the Azure
+Portal is experiencing an Azure RBAC gap, not an ACL gap. A staff member
+who can browse the Portal but is denied on a specific path in the mirror
+has an ADLS2 POSIX ACL gap.
 
 ---
 

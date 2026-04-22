@@ -358,11 +358,13 @@ deploy across all environments and sub-environments. Environment
 dirs (`dev/`, `test/`, `staging/`, `prod/`, etc.) define what's
 deployed where. CI: `.github/workflows/dagger-entrypoint.yml`.
 
-### docker (Docker Compose)
+### docker (Docker Compose + shared CI Dockerfiles)
 
-Local dev environment for microservices. Requires sibling repos
-(auth-node-llama, users-node-llama, etc.) cloned at the same directory
-level.
+Serves two purposes:
+
+**1. Local dev environment** — Docker Compose setup for running
+microservices locally. Requires sibling repos (auth-node-llama,
+users-node-llama, etc.) cloned at the same directory level.
 
 ```bash
 ./get-env.sh                      # Fetch secrets from Azure Key Vault
@@ -372,6 +374,23 @@ docker-compose up -d               # Start detached
 docker-compose down -v             # Stop and wipe volumes
 ./docker-compose-build-workaround.sh  # Parallel build workaround
 ```
+
+**2. Shared CI Dockerfiles** — the `docker` repo is also the central
+store for the Dockerfiles used by CI to build production images. They
+are organized by microservice type:
+
+| Directory | Used by |
+|---|---|
+| `node/Dockerfile` | All `*-node-*` services |
+| `react/Dockerfile` | All `*-react-*` services |
+| `go/Dockerfile` | All `*-go-*` services |
+
+The CI build workflow always clones this repo at `ref: main`, so the
+tip of `main` is the active Dockerfile for every build. Changing a
+Dockerfile here affects **all services of that type** on their next
+build — there is no per-service override at the Dockerfile level
+(unless a service uses a custom `BUILD_TYPE_LOOKUP` entry; see
+[Microservice repos](#microservice-repos) under CI Workflows).
 
 ### korio-nginx-docker (Docker)
 
@@ -638,9 +657,12 @@ flowchart TD
 ```
 
 **1. Build (microservice repo)**
-The developer's CI builds a Docker image and pushes it to ACR
-tagged with the git SHA (e.g.,
-`korio.azurecr.io/users-node:98960d94d8...`).
+The service's deploy workflow triggers, builds a Docker image using
+the shared Dockerfile from `korio-clinical/docker`, and pushes it to
+ACR tagged with the git SHA (e.g.,
+`korio.azurecr.io/users-node:98960d94d8...`). See
+[Microservice repos](#microservice-repos) under CI Workflows for the
+full build pipeline.
 
 **2. Update presto-besto-manifesto** ← _only manual step_
 The developer updates `<env>/deployments.yaml` with the new image
@@ -712,6 +734,73 @@ Dagger CLI (v0.19.7), then delegates to the `dagger-presto` module
 (pinned at `v1.0.5` via SSH) by calling its `actions-entrypoint`
 function. Uses a GitHub App token for auth and SSH agent for private
 repo access.
+
+### Microservice repos
+
+Every microservice repo contains one deploy workflow per environment
+(e.g. `dev-deploy.yml`, `staging-deploy.yml`). These files are
+**managed by Terraform** (see `terraform-infra/org/github_workflows`)
+and should not be edited by hand.
+
+Each env-specific workflow is a thin wrapper that calls the reusable
+`deploy.yml` from `korio-clinical/github-reusable-workflows`, passing
+only the target environment name:
+
+```yaml
+jobs:
+  deploy:
+    uses: korio-clinical/github-reusable-workflows/.github/workflows/deploy.yml@main
+    with:
+      environment: dev
+    secrets: inherit
+```
+
+The reusable `deploy.yml` orchestrates the following jobs in sequence:
+
+```
+checkPermissions -> prepare -> build -> notifyDeployType -> deployHelm
+                                                         -> deployKustomize
+```
+
+**`configuration-service-name-type.yml` (prepare)**
+
+Derives four values from the calling repo's name and org-level
+GitHub variables:
+
+| Output | How it is derived |
+|---|---|
+| `microservice_name` | Repo name minus the `-llama` suffix; for `release/*` branches in multitenancy envs, appended with the branch suffix (e.g. `back-end-node-v3.3.0`) |
+| `microservice_type` | Repo name suffix: `node`, `react`, `go`, or `docker` |
+| `build_type` | `BUILD_TYPE_LOOKUP` org variable (JSON map of repo name → build type); defaults to `docker-korio-microservice` |
+| `deployment_type` | `DEPLOYMENT_TYPE_LOOKUP` org variable; defaults to `helm` |
+
+**`build-microservice.yml` (build)**
+
+Builds and pushes the container image to ACR, tagged with `github.sha`
+and `latest`.
+
+For the default `build_type` of `docker-korio-microservice`:
+
+1. Clones `korio-clinical/docker` at `ref: main` into `./docker/`
+2. Runs `docker build` using `./docker/<microservice_type>/Dockerfile`
+   with the service repo as the build context
+
+For any other `build_type` (set via `BUILD_TYPE_LOOKUP`), a
+`Dockerfile` in the service repo root is used instead.
+
+**Shared Dockerfile and runtime versions**
+
+Because the Dockerfile is fetched from `korio-clinical/docker` at
+`main` on every build, the runtime version (e.g. the `FROM node:X.Y`
+base image in `node/Dockerfile`) is controlled centrally. A change
+there takes effect for all services of that type on their next build
+— there is no per-service Dockerfile unless the repo is explicitly
+listed in `BUILD_TYPE_LOOKUP` with a custom build type.
+
+To change the Node.js runtime version for node services, update
+`node/Dockerfile` in `korio-clinical/docker` and merge to `main`.
+Rebuild each affected service branch to produce a new image, then
+update its SHA in `presto-besto-manifesto`.
 
 ## Azure Entra B2C Integration
 
