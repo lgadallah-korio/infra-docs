@@ -90,3 +90,14 @@ Detailed reference documentation is split by domain:
   Container Insights, Log Analytics), Grafana dashboards and RBAC,
   alerting (Prometheus rules, Atlas alerts), PagerDuty escalation,
   log sampling and cost control, Terraform workspace layout
+
+## Runbooks
+
+Operational procedures in `infra-docs/runbooks/`:
+
+- **[sftp-modify-human-user-access.md](infra-docs/runbooks/sftp-modify-human-user-access.md)** — Add/remove human SFTP users: study-scoped group removal, full user removal, Key Vault shadow file guidance
+- **[enable-prod-validate.md](infra-docs/runbooks/enable-prod-validate.md)** — Activate the prod-validate sub-environment
+- **[validate-subenv-config.md](infra-docs/runbooks/validate-subenv-config.md)** — Validate sub-environment configuration
+- **[argocd-sync-failures.md](infra-docs/runbooks/argocd-sync-failures.md)** — Diagnose and fix ArgoCD Application sync failures
+- **[add-atlas-database.md](infra-docs/runbooks/add-atlas-database.md)** — Add a new MongoDB Atlas database
+- **[AddSFTPFoldersRunbook.pdf](infra-docs/runbooks/AddSFTPFoldersRunbook.pdf)** — Add SFTP folders (legacy PDF)

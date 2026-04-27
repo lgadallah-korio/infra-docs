@@ -223,6 +223,39 @@ client-specific URL prefix.
 | Legacy (e.g. `m4157-p101-phase3`) | `/api/v1/site-{client}/` | Dedicated `sites-node-{client}` microservice; auth via `auth-node` |
 | Newer (e.g. `v3.1.0`, `main`) | `/api/v1/site-{version}/` | `back-end-node-{version}` (monolithic); auth via `back-end-node`; uses the internal NGINX gateway for trusted in-cluster fan-out |
 
+### Auth Layer as a Single Point of Failure
+
+`auth_request` is present on every external location block, including
+routes that serve static assets (JS bundles, CSS, `manifest.json`).
+This means auth-node availability is a prerequisite for every request
+the browser makes — not just API calls.
+
+The most common hidden cause of a total front-end outage (Cloudflare
+520s on all assets, `manifest.json` returning HTML) is MongoDB
+performance degradation cascading through auth-node:
+
+1. **MongoDB slows** — queries take much longer than normal, or the
+   Atlas connection pool exhausts (auth-node holds a fixed pool of
+   database connections; once all are in use, new requests queue; once
+   the queue fills, they fail outright).
+2. **auth-node `/verify` backs up** — every NGINX `auth_request`
+   subrequest waits on a MongoDB user lookup that never completes in
+   time.
+3. **NGINX returns 5xx for all requests** — including the static asset
+   fetches the browser makes after loading the HTML shell.
+4. **Cloudflare converts the 5xx to a 520** — the browser receives
+   520s for JS, CSS, and `manifest.json`; the `manifest.json` response
+   body is whatever error HTML the origin returned, which the browser
+   then fails to parse as JSON.
+
+The symptom looks like a routing or build artifact problem because the
+HTML shell loads (it may be cached, or may have loaded before the DB
+degraded), but all subsequent asset requests fail. The actual fault is
+several hops upstream in the auth → database path.
+
+See the [auth-node MongoDB degradation runbook](runbooks/auth-node-mongodb-degradation.md)
+for diagnosis and remediation steps.
+
 The **internal NGINX gateway** (`internal-api-gateway-cm.yaml`) mirrors
 the external one but carries no `auth_request` directives — it is
 purely for trusted service-to-service calls originating from
@@ -634,8 +667,15 @@ There is no dagger-presto or korioctl automation for this service.
 
 ## Microservice Deployment Lifecycle
 
-When a developer adds a feature to a microservice, the sequence is
-(yellow = manual step, green = automated):
+> **Adding a brand-new service?** The lifecycle below describes updating
+> an *existing* service. A net-new service has additional prerequisites
+> (GitHub repo provisioning via Terraform, first image build, Key Vault
+> secrets, and optionally envfrom ConfigMaps or Azure Workload Identity).
+> See the [Add a New Service runbook](runbooks/add-new-service.md) for
+> the full checklist.
+
+When a developer adds a feature to an existing microservice, the sequence
+is (yellow = manual step, green = automated):
 
 ```mermaid
 flowchart TD

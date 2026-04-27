@@ -56,6 +56,7 @@ Step-by-step procedures for specific operational tasks.
 
 | Runbook | What it covers |
 |---|---|
+| [Add New Service](runbooks/add-new-service.md) | Adding a brand-new application microservice: GitHub repo provisioning, first image build, Key Vault secrets, presto manifest, envfrom ConfigMaps, Workload Identity, React SPA wiring |
 | [Add Atlas Database](runbooks/add-atlas-database.md) | Adding a new MongoDB Atlas database (integration) via Terraform |
 | [ArgoCD Sync Failures](runbooks/argocd-sync-failures.md) | Diagnosing and resolving ArgoCD application sync failures |
 | [Atlas Credential Reconciliation](runbooks/atlas-credential-reconciliation.md) | Reconciling MongoDB Atlas database credentials with Key Vault |
