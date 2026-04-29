@@ -108,10 +108,20 @@ Note: `envFromDownwardAPI` does not control how NGINX routes *incoming*
 requests — NGINX's static config drives routing via path prefix matching to
 `appName`-derived Service names. `KORIO_PLATFORM_VERSION` is a runtime hint
 available to the service itself for constructing outbound call paths.
-Int-nest-node does not currently appear in any NGINX location block; its
-`envFromDownwardAPI` use is in active development
-(`jl/korio-platform-version-env-var/DI-2647`) to enable versioned outbound
-routing once the corresponding internal NGINX routes are added.
+
+**`int-nest-node` status** — the `int-` prefix denotes an integration service
+(third-party system integrations: Fisher, Cluepoints, CTMS, PCI, etc.), not an
+internal-only service. `envFromDownwardAPI` is configured in prod, staging,
+test, and platform AppSets but is missing from the dev AppSet — meaning dev
+pods lack `KORIO_APP_NAME`, which the service validates as required at startup
+(throws `ConfigError` if absent) and uses to match `version` fields in
+`global_integrations` MongoDB documents. `KORIO_PLATFORM_VERSION` is declared
+in the AppSet but not yet consumed by the application code; int-nest-node
+currently uses per-service `*_NODE_BASE_URL` env vars for outbound calls rather
+than the `INTERNAL_BASE_URL` + `KORIO_PLATFORM_VERSION` path-construction
+pattern. The service's decided canonical API prefix is `/api/v1/integrations`;
+NGINX location blocks are added via `apiRoutes.yaml` in presto-besto-manifesto
+(see [presto-besto-manifesto](#presto-besto-manifesto-yaml) below).
 
 ### End-to-End Request Flow (Login → Client-Specific API Call)
 
@@ -391,6 +401,52 @@ deploy across all environments and sub-environments. Environment
 dirs (`dev/`, `test/`, `staging/`, `prod/`, etc.) define what's
 deployed where. CI: `.github/workflows/dagger-entrypoint.yml`.
 
+Each environment directory contains up to three manifest files:
+
+- **`deployments.yaml`** — one entry per service, declaring the repo,
+  the git branch/version to deploy, and the image SHA.
+- **`apiRoutes.yaml`** — declares which URL paths the external NGINX
+  API gateway should expose, and which service handles each. This is
+  the **only** place to add or modify NGINX location blocks; the
+  `api-gateway-cm.yaml` files in the `argocd` repo are fully generated
+  by korioctl from this file and must not be edited by hand (a
+  subsequent Presto run would overwrite manual changes). Format:
+  ```yaml
+  apiRoutes:
+    /api/v1/<canonical-path>:
+      <branch>: <base-service-name>
+  ```
+  Each branch entry generates one versioned location block
+  (`/api/v1/<canonical-path>-<version>/`) that rewrites to the
+  canonical path before forwarding to the named Kubernetes Service.
+
+  **Base service name rule:** `<base-service-name>` must always be the
+  unversioned base name (e.g. `int-nest-node`, never
+  `int-nest-node-v1-0-0`). korioctl derives the versioned Kubernetes
+  Service name automatically by appending the branch's version suffix
+  (e.g. `-v1-0-0` for `release/v1.0.0`). Using a pre-versioned name
+  here produces an upstream that does not match any deployed Service.
+
+  **`BasePaths` prerequisite:** before an `apiRoutes.yaml` entry can
+  work for a service, that service must be registered in the `BasePaths`
+  map in `korioctl/pkg/service/routes.go`. This hardcoded map controls
+  which services are eligible for NGINX location blocks at all. A missing
+  entry causes the Dagger pipeline to fail with:
+  ```
+  Error applying apiRoutes: route upstream missing from deployments:
+  /api/v1/<path>/ => <service-name>
+  ```
+  Adding a service to `BasePaths` requires a korioctl PR (see the
+  [add-new-service.md](runbooks/add-new-service.md) runbook).
+
+  **Application-level alignment:** the service must declare a matching
+  global API prefix in its application code. For NestJS services this
+  means calling `app.setGlobalPrefix('api/v1/<canonical-path>')` in the
+  bootstrap file. Without it, the path configured on the gateway does not
+  match the paths the service actually handles.
+- **`subenvironments.yaml`** — per-subenv configuration (env vars,
+  secrets, identities) that is merged into the generated AppSets.
+
 ### docker (Docker Compose + shared CI Dockerfiles)
 
 Serves two purposes:
@@ -480,7 +536,7 @@ presto-besto-manifesto:
 | `envFrom` | ConfigMap → `env[].valueFrom.configMapKeyRef` | Points to per-subenv `{service}-envfrom` ConfigMaps committed in `argocd/apps/{env}/{subenv}/` |
 | `externalSecret` | ExternalSecret → K8s Secret `{appName}-kv` → `envFrom:secretRef` | Maps env var names to Azure Key Vault secret names; fetched at runtime |
 | `secret` | K8s Secret → `envFrom:secretRef` | Inline secrets (avoid for sensitive values) |
-| `envFromDownwardAPI` | `env[].valueFrom.fieldRef` | Kubernetes Downward API — reads pod metadata fields into env vars; currently used to inject `KORIO_PLATFORM_VERSION` (from the `korioPlatformVersion` pod label set by the Helm chart) and `KORIO_APP_NAME` (from the `app` label); see NGINX section for how `korioPlatformVersion` relates to path routing |
+| `envFromDownwardAPI` | `env[].valueFrom.fieldRef` | Kubernetes Downward API — reads pod metadata fields into env vars. Injects `KORIO_APP_NAME` (from the `app` pod label) and `KORIO_PLATFORM_VERSION` (from the `korioPlatformVersion` pod label set by the Helm chart). `KORIO_APP_NAME` is required at startup by integration services (e.g. `int-nest-node`) to match `version` fields in MongoDB config documents; missing it causes a fatal `ConfigError`. `KORIO_PLATFORM_VERSION` is intended for versioned outbound path construction (`${INTERNAL_BASE_URL}/api/v1/studies-${KORIO_PLATFORM_VERSION}/`) but is not yet consumed by all services. See NGINX section for how `korioPlatformVersion` relates to path routing. |
 
 ### Checksum-driven rolling restarts
 
